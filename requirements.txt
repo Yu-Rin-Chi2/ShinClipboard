@@ -1,0 +1,4 @@
+pynput>=1.7.7,<2
+pyperclip>=1.9,<2
+pystray>=0.19.5,<1
+Pillow>=10,<12

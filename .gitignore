@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+dist/
+*.bak
+.smoke-data/
+.exe-smoke-data/
+.runtime-check/
+.final-smoke/
