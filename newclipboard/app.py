@@ -168,6 +168,21 @@ class NewClipboardApp:
         self.call_history_list.bind("<ButtonRelease-1>", self._call_history_click)
         self.call_history_list.bind("<Return>", lambda _: self._paste_call_history())
 
+        group_bar = ttk.Frame(snippet_frame)
+        group_bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(group_bar, text="グループ").pack(side="left", padx=(2, 6))
+        self.call_group_var = tk.StringVar()
+        self.call_group_id: str | None = None
+        self.call_group_combo = ttk.Combobox(
+            group_bar,
+            textvariable=self.call_group_var,
+            state="readonly",
+        )
+        self.call_group_combo.pack(side="left", fill="x", expand=True)
+        self.call_group_combo.bind("<<ComboboxSelected>>", self._call_group_changed)
+        self.call_group_combo.bind("<Control-Left>", lambda _: self._move_call_group(-1))
+        self.call_group_combo.bind("<Control-Right>", lambda _: self._move_call_group(1))
+
         self.call_snippet_list = tk.Listbox(
             snippet_frame,
             activestyle="none",
@@ -178,6 +193,8 @@ class NewClipboardApp:
         self.call_snippet_list.pack(fill="both", expand=True)
         self.call_snippet_list.bind("<ButtonRelease-1>", self._call_snippet_click)
         self.call_snippet_list.bind("<Return>", lambda _: self._paste_call_snippet())
+        self.call_snippet_list.bind("<Control-Left>", lambda _: self._move_call_group(-1))
+        self.call_snippet_list.bind("<Control-Right>", lambda _: self._move_call_group(1))
         self.call_window.withdraw()
 
     def _build_history_tab(self) -> None:
@@ -489,22 +506,54 @@ class NewClipboardApp:
             return
         self.call_snippet_items = []
         self.call_snippet_list.delete(0, "end")
+        groups = self.config["groups"]
+        self.call_group_combo.configure(values=[group["name"] for group in groups])
+        if not groups:
+            self.call_group_id = None
+            self.call_group_var.set("")
+            return
+
+        group_index = next(
+            (index for index, group in enumerate(groups) if group["id"] == self.call_group_id),
+            0,
+        )
+        group = groups[group_index]
+        self.call_group_id = group["id"]
+        self.call_group_combo.current(group_index)
         colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
-        for group in self.config["groups"]:
-            for snippet in group.get("snippets", []):
-                index = len(self.call_snippet_items)
-                self.call_snippet_items.append(snippet)
-                preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")
-                prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
-                label = f"{prefix}[{group['name']}] {snippet['title']}  —  {preview[:110]}"
-                self.call_snippet_list.insert("end", label)
-                self.call_snippet_list.itemconfigure(
-                    index,
-                    background=colors["stripe"] if index % 2 else colors["background"],
-                    foreground=colors["foreground"],
-                    selectbackground=colors["accent"],
-                    selectforeground="#ffffff",
-                )
+        for snippet in group.get("snippets", []):
+            index = len(self.call_snippet_items)
+            self.call_snippet_items.append(snippet)
+            preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")
+            prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
+            label = f"{prefix}{snippet['title']}  —  {preview[:130]}"
+            self.call_snippet_list.insert("end", label)
+            self.call_snippet_list.itemconfigure(
+                index,
+                background=colors["stripe"] if index % 2 else colors["background"],
+                foreground=colors["foreground"],
+                selectbackground=colors["accent"],
+                selectforeground="#ffffff",
+            )
+
+    def _call_group_changed(self, _event=None) -> None:
+        index = self.call_group_combo.current()
+        groups = self.config["groups"]
+        if 0 <= index < len(groups):
+            self.call_group_id = groups[index]["id"]
+            self._refresh_call_snippets()
+            self._focus_call_list()
+
+    def _move_call_group(self, offset: int):
+        groups = self.config["groups"]
+        if not groups:
+            return "break"
+        current = max(0, self.call_group_combo.current())
+        target = (current + offset) % len(groups)
+        self.call_group_id = groups[target]["id"]
+        self._refresh_call_snippets()
+        self._focus_call_list()
+        return "break"
 
     def _selected_history(self):
         selected = self.history_list.curselection()
