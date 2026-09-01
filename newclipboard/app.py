@@ -24,9 +24,9 @@ from .transforms import apply_enabled, apply_transform
 
 
 THEMES = {
-    "blue": {"background": "#f8fbff", "stripe": "#e7f0ff", "accent": "#2563eb", "foreground": "#172033"},
-    "dark": {"background": "#1f2937", "stripe": "#2d3a4d", "accent": "#38bdf8", "foreground": "#f8fafc"},
-    "green": {"background": "#f6fffb", "stripe": "#dcf7eb", "accent": "#059669", "foreground": "#15332b"},
+    "blue": {"background": "#ffffff", "stripe": "#e4eaf2", "accent": "#075dcc", "foreground": "#172033"},
+    "dark": {"background": "#1f2937", "stripe": "#354154", "accent": "#0284c7", "foreground": "#f8fafc"},
+    "green": {"background": "#ffffff", "stripe": "#e1eee8", "accent": "#047857", "foreground": "#15332b"},
 }
 
 
@@ -138,7 +138,14 @@ class NewClipboardApp:
         self.search_var.trace_add("write", lambda *_: self._refresh_history())
         ttk.Button(top, text="選択を削除", command=self._delete_history).pack(side="left", padx=(0, 6))
         ttk.Button(top, text="すべて削除", command=self._clear_history).pack(side="left")
-        self.history_list = tk.Listbox(self.history_tab, activestyle="dotbox", font=("Yu Gothic UI", 11), selectmode="extended")
+        self.history_list = tk.Listbox(
+            self.history_tab,
+            activestyle="none",
+            exportselection=False,
+            font=("Yu Gothic UI", 11),
+            selectborderwidth=0,
+            selectmode="extended",
+        )
         self.history_list.pack(fill="both", expand=True)
         self.history_list.bind("<Double-Button-1>", lambda _: self._paste_selected_history())
         self.history_list.bind("<Return>", lambda _: self._paste_selected_history())
