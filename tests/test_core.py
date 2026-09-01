@@ -2,8 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+
 from newclipboard.core import ClipboardHistory, FifoQueue
-from newclipboard.hotkeys import portable_to_pynput
+from newclipboard.hotkeys import DoubleTapDetector, portable_to_pynput
 from newclipboard.storage import JsonStore
 from newclipboard.transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from newclipboard.transforms import apply_transform
@@ -22,6 +24,13 @@ class HistoryTests(unittest.TestCase):
         history = ClipboardHistory(limit=10)
         history.add("Hello World")
         self.assertEqual(history.search("hello")[0].text, "Hello World")
+
+    def test_image_history_is_deduplicated(self):
+        history = ClipboardHistory(limit=10)
+        history.add_image("images/a.png", 320, 200, "1")
+        history.add_image("images/a.png", 320, 200, "2")
+        self.assertEqual(len(history.search()), 1)
+        self.assertEqual(history.search("画像")[0].kind, "image")
 
 
 class FifoTests(unittest.TestCase):
@@ -64,15 +73,44 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(loaded["groups"][0]["name"], "共有グループ")
             self.assertTrue(store.config_path.with_suffix(".json.bak").exists())
 
+    def test_image_is_saved_by_content_hash_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = JsonStore(Path(folder))
+            relative, width, height = store.save_image(Image.new("RGB", (8, 6), "red"))
+            self.assertEqual((width, height), (8, 6))
+            self.assertTrue(store.image_path(relative).exists())
+            history = ClipboardHistory(limit=10)
+            history.add_image(relative, width, height)
+            store.save_history(history)
+            history.clear()
+            store.save_history(history)
+            self.assertFalse(store.image_path(relative).exists())
+
+    def test_image_path_cannot_escape_data_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = JsonStore(Path(folder))
+            with self.assertRaises(ValueError):
+                store.image_path("../outside.png")
+
 
 class HotkeyTests(unittest.TestCase):
     def test_portable_primary_hotkey(self):
         translated = portable_to_pynput("primary+shift+space")
         self.assertIn(translated, {"<ctrl>+<shift>+<space>", "<cmd>+<shift>+<space>"})
+        self.assertEqual(portable_to_pynput("ctrl+space"), "<ctrl>+<space>")
 
     def test_single_key_is_rejected(self):
         with self.assertRaises(ValueError):
             portable_to_pynput("space")
+
+    def test_double_tap_requires_release_and_short_interval(self):
+        detector = DoubleTapDetector(interval=0.35)
+        self.assertFalse(detector.press(1.0))
+        self.assertFalse(detector.press(1.1))
+        detector.release()
+        self.assertTrue(detector.press(1.2))
+        detector.release()
+        self.assertFalse(detector.press(2.0))
 
 
 class TransformTests(unittest.TestCase):
@@ -93,7 +131,10 @@ class TransferTests(unittest.TestCase):
             config = source_store.load_config()
             config["groups"][0]["snippets"][0]["memo"] = "memo"
             source_store.save_config(config)
-            source_store.save_history(ClipboardHistory(limit=10))
+            history = ClipboardHistory(limit=10)
+            relative, width, height = source_store.save_image(Image.new("RGB", (5, 4), "blue"))
+            history.add_image(relative, width, height)
+            source_store.save_history(history)
             csv_path = base / "snippets.csv"
             export_snippets_csv(config, csv_path)
             target = source_store.load_config()
@@ -107,6 +148,7 @@ class TransferTests(unittest.TestCase):
             restore_backup(backup, restored_config, restored_history)
             self.assertTrue(restored_config.exists())
             self.assertTrue(restored_history.exists())
+            self.assertTrue((restored_history.parent / relative).exists())
 
 
 if __name__ == "__main__":

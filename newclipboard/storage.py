@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import os
 from pathlib import Path
 from shutil import copy2
 from tempfile import NamedTemporaryFile
 from typing import Any
 from uuid import uuid4
+
+from PIL import Image
 
 from .core import ClipboardHistory, HistoryItem
 
@@ -19,10 +23,11 @@ def default_config() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "settings": {
             "history_limit": 1000,
-            "popup_hotkey": "primary+shift+space",
+            "popup_hotkey": "ctrl+space",
             "fifo_toggle_hotkey": "primary+shift+f",
             "lifo_toggle_hotkey": "primary+shift+l",
             "monitor_toggle_hotkey": "primary+shift+m",
+            "double_ctrl_popup": True,
             "start_minimized": False,
             "auto_paste": True,
             "save_history": True,
@@ -109,6 +114,38 @@ class JsonStore:
 
     def save_history(self, history: ClipboardHistory) -> None:
         self._atomic_write(self.history_path, {"schema_version": SCHEMA_VERSION, "items": history.to_list()})
+        self.cleanup_images(history)
+
+    def save_image(self, image: Image.Image) -> tuple[str, int, int]:
+        normalized = image.convert("RGBA")
+        buffer = io.BytesIO()
+        normalized.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        digest = hashlib.sha256(data).hexdigest()
+        relative = Path("images") / f"{digest}.png"
+        target = self.data_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_bytes(data)
+        return relative.as_posix(), normalized.width, normalized.height
+
+    def image_path(self, relative: str) -> Path:
+        target = (self.data_dir / relative).resolve()
+        try:
+            target.relative_to(self.data_dir)
+        except ValueError as error:
+            raise ValueError("画像履歴のパスが保存先の外を指しています。") from error
+        return target
+
+    def cleanup_images(self, history: ClipboardHistory) -> None:
+        image_dir = self.data_dir / "images"
+        if not image_dir.exists():
+            return
+        referenced = {item.image_path for item in history.search() if item.kind == "image"}
+        for path in image_dir.glob("*.png"):
+            relative = path.relative_to(self.data_dir).as_posix()
+            if relative not in referenced:
+                path.unlink()
 
     @staticmethod
     def _read(path: Path) -> dict[str, Any]:

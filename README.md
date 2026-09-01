@@ -4,9 +4,10 @@ Windows / macOS 向けの、クリップボード履歴・定型文・連続貼�
 
 ## 主な機能
 
-- テキストのクリップボード履歴を自動保存（重複は最新位置へ移動）
+- テキストと画像のクリップボード履歴を自動保存（重複は最新位置へ移動）
 - 定型文をグループ分けし、個別のグローバルショートカットから貼り付け
-- `primary+shift+space` でどのアプリからでも画面を表示
+- `Ctrl+Space` またはCtrlキー2回で、どのアプリからでも画面を表示
+- 一覧の `1〜0、a〜z` またはシングルクリックで元のアプリへ即時貼り付け
 - FIFO / LIFOモードで、コピー順または逆順に連続貼り付け
 - ストックの追加・編集・削除・貼り付け取り消し・全件連結
 - 履歴の編集・複数選択連結・改行ごとの展開
@@ -36,14 +37,14 @@ macOSでは初回に「システム設定 > プライバシーとセキュリテ
 
 ## 操作
 
-1. 通常どおりコピーすると「履歴」へ保存されます。
-2. 履歴または定型文をダブルクリックすると、元のアプリへ貼り付けます。
+1. 通常どおりテキストや画像をコピーすると「履歴」へ保存されます。
+2. 履歴または定型文をシングルクリックするか、行頭のキーを押すと元のアプリへ貼り付けます。
 3. 「FIFO」または「LIFO」で開始後、複数回コピーします。通常の貼り付けキーを押すたびに順番に貼り付けます。
 4. 定型文のショートカットは `primary+alt+1` のように指定できます。
 
 既定のグローバルショートカットは以下です。
 
-- 画面表示: `primary+shift+space`
+- 画面表示: `Ctrl+Space` またはCtrlキー2回
 - FIFO切替: `primary+shift+f`
 - LIFO切替: `primary+shift+l`
 - 監視切替: `primary+shift+m`
@@ -56,7 +57,7 @@ macOSでは初回に「システム設定 > プライバシーとセキュリテ
 ## バックアップとCSV
 
 - JSON書き出し: 履歴を含めず、Windows / macOSで共有する設定と定型文を保存
-- 全バックアップ: 設定と履歴をZIPへ保存
+- 全バックアップ: 設定、テキスト履歴、画像履歴をZIPへ保存
 - 定型文CSV: UTF-8 BOM付きで出力し、UTF-8またはShift_JISを取り込み
 - 復元時は、現在のデータを `before-restore.zip` へ自動退避
 
@@ -87,7 +88,7 @@ python -m PyInstaller --clean NewClipboard.spec
 
 ## 保存先
 
-- Windows: `%APPDATA%\NewClipboard\config.json` と `history.json`
-- macOS: `~/.newclipboard/config.json` と `history.json`
+- Windows: `%APPDATA%\NewClipboard\config.json`、`history.json`、`images/`
+- macOS: `~/.newclipboard/config.json`、`history.json`、`images/`
 
 設定JSONはスキーマバージョン付きです。読み込み時は現設定を `config.json.bak` に退避してから置換します。

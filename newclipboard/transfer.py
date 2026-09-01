@@ -68,12 +68,18 @@ def create_backup(config_path: Path, history_path: Path, destination: Path) -> N
         archive.write(config_path, "config.json")
         if history_path.exists():
             archive.write(history_path, "history.json")
+        image_dir = history_path.parent / "images"
+        if image_dir.exists():
+            for image_path in image_dir.glob("*.png"):
+                archive.write(image_path, f"images/{image_path.name}")
 
 
 def restore_backup(source: Path, config_path: Path, history_path: Path) -> None:
     with zipfile.ZipFile(source, "r") as archive:
         names = set(archive.namelist())
-        if "config.json" not in names or names - {"config.json", "history.json"}:
+        allowed = {"config.json", "history.json"}
+        allowed.update(name for name in names if name.startswith("images/") and Path(name).name == name.removeprefix("images/") and name.endswith(".png"))
+        if "config.json" not in names or names - allowed:
             raise ValueError("NewClipboardのバックアップ形式ではありません。")
         config = json.loads(archive.read("config.json").decode("utf-8-sig"))
         if not isinstance(config, dict) or "schema_version" not in config:
@@ -81,3 +87,9 @@ def restore_backup(source: Path, config_path: Path, history_path: Path) -> None:
         config_path.write_bytes(archive.read("config.json"))
         if "history.json" in names:
             history_path.write_bytes(archive.read("history.json"))
+        image_names = [name for name in names if name.startswith("images/")]
+        if image_names:
+            image_dir = history_path.parent / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            for name in image_names:
+                (image_dir / Path(name).name).write_bytes(archive.read(name))

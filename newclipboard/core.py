@@ -15,13 +15,27 @@ def utc_now() -> str:
 class HistoryItem:
     text: str
     copied_at: str
+    kind: str = "text"
+    image_path: str = ""
+    width: int = 0
+    height: int = 0
 
     def to_dict(self) -> dict[str, str]:
-        return {"text": self.text, "copied_at": self.copied_at}
+        value = {"kind": self.kind, "text": self.text, "copied_at": self.copied_at}
+        if self.kind == "image":
+            value.update({"image_path": self.image_path, "width": self.width, "height": self.height})
+        return value
 
     @classmethod
     def from_dict(cls, value: dict) -> "HistoryItem":
-        return cls(text=str(value.get("text", "")), copied_at=str(value.get("copied_at", "")))
+        return cls(
+            text=str(value.get("text", "")),
+            copied_at=str(value.get("copied_at", "")),
+            kind=str(value.get("kind", "text")),
+            image_path=str(value.get("image_path", "")),
+            width=int(value.get("width", 0)),
+            height=int(value.get("height", 0)),
+        )
 
 
 class ClipboardHistory:
@@ -37,8 +51,17 @@ class ClipboardHistory:
         if not text:
             return False
         with self._lock:
-            self._items = [item for item in self._items if item.text != text]
+            self._items = [item for item in self._items if item.kind != "text" or item.text != text]
             self._items.insert(0, HistoryItem(text, copied_at or utc_now()))
+            self._trim()
+        return True
+
+    def add_image(self, image_path: str, width: int, height: int, copied_at: str | None = None) -> bool:
+        if not image_path:
+            return False
+        with self._lock:
+            self._items = [item for item in self._items if item.kind != "image" or item.image_path != image_path]
+            self._items.insert(0, HistoryItem("", copied_at or utc_now(), "image", image_path, width, height))
             self._trim()
         return True
 
@@ -54,7 +77,12 @@ class ClipboardHistory:
         with self._lock:
             items = list(self._items)
         needle = query.casefold().strip()
-        return items if not needle else [item for item in items if needle in item.text.casefold()]
+        if not needle:
+            return items
+        return [
+            item for item in items
+            if needle in item.text.casefold() or item.kind == "image" and needle in "画像 image".casefold()
+        ]
 
     def to_list(self) -> list[dict[str, str]]:
         return [item.to_dict() for item in self.search()]

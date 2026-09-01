@@ -9,3 +9,4 @@ dist/
 .exe-smoke-data/
 .runtime-check/
 .final-smoke/
+.image-smoke/

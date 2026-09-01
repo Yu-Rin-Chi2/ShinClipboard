@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import pyperclip
 
+from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .core import FifoQueue
 from .hotkeys import GlobalHotkeyService
 from .startup import set_startup, startup_enabled
@@ -35,6 +36,13 @@ def resource_path(relative: str) -> Path:
     return base / relative
 
 
+QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
+
+
+def quick_key(index: int) -> str:
+    return QUICK_KEYS[index] if 0 <= index < len(QUICK_KEYS) else ""
+
+
 class NewClipboardApp:
     POLL_MS = 350
 
@@ -50,6 +58,7 @@ class NewClipboardApp:
         self.monitor_enabled = True
         self.last_fifo_value: str | None = None
         self.last_clipboard = self._read_clipboard()
+        self.last_clipboard_token = clipboard_change_token()
         self.ignore_fifo_text: str | None = None
         self.events: queue.Queue[tuple[str, object | None]] = queue.Queue()
         self.hotkeys: GlobalHotkeyService | None = None
@@ -74,6 +83,7 @@ class NewClipboardApp:
         self.always_on_top_var = tk.BooleanVar()
         self.start_minimized_var = tk.BooleanVar()
         self.startup_var = tk.BooleanVar(value=startup_enabled())
+        self.double_ctrl_var = tk.BooleanVar()
         self.monitor_status_var = tk.StringVar()
         self.monitor_status_var.set("監視中")
 
@@ -93,6 +103,7 @@ class NewClipboardApp:
         self.root.geometry("920x720")
         self.root.minsize(720, 500)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.root.bind("<KeyPress>", self._quick_select)
         icon_png = resource_path("assets/newclipboard-512.png")
         if icon_png.exists():
             self.window_icon = tk.PhotoImage(file=icon_png)
@@ -147,7 +158,8 @@ class NewClipboardApp:
             selectmode="extended",
         )
         self.history_list.pack(fill="both", expand=True)
-        self.history_list.bind("<Double-Button-1>", lambda _: self._paste_selected_history())
+        self.history_list.bind("<ButtonRelease-1>", self._history_single_click)
+        self.history_list.bind("<Button-3>", self._history_right_click)
         self.history_list.bind("<Return>", lambda _: self._paste_selected_history())
         bar = ttk.Frame(self.history_tab)
         bar.pack(fill="x", pady=(8, 0))
@@ -181,17 +193,20 @@ class NewClipboardApp:
         ttk.Label(snippet_search, text="定型文検索").pack(side="left")
         ttk.Entry(snippet_search, textvariable=self.snippet_search_var).pack(side="left", fill="x", expand=True, padx=8)
         self.snippet_search_var.trace_add("write", lambda *_: self._refresh_snippets())
-        self.snippet_tree = ttk.Treeview(right, columns=("title", "memo", "preview", "hotkey"), show="headings")
+        self.snippet_tree = ttk.Treeview(right, columns=("key", "title", "memo", "preview", "hotkey"), show="headings")
+        self.snippet_tree.heading("key", text="キー")
         self.snippet_tree.heading("title", text="名前")
         self.snippet_tree.heading("memo", text="メモ")
         self.snippet_tree.heading("preview", text="内容")
         self.snippet_tree.heading("hotkey", text="ショートカット")
+        self.snippet_tree.column("key", width=45, anchor="center", stretch=False)
         self.snippet_tree.column("title", width=150)
         self.snippet_tree.column("memo", width=120)
         self.snippet_tree.column("preview", width=250)
         self.snippet_tree.column("hotkey", width=150)
         self.snippet_tree.pack(fill="both", expand=True, pady=6)
-        self.snippet_tree.bind("<Double-Button-1>", lambda _: self._paste_selected_snippet())
+        self.snippet_tree.bind("<ButtonRelease-1>", self._snippet_single_click)
+        self.snippet_tree.bind("<Button-3>", self._snippet_right_click)
         self.snippet_tree.bind("<Return>", lambda _: self._paste_selected_snippet())
         bar = ttk.Frame(right)
         bar.pack(fill="x")
@@ -259,13 +274,15 @@ class NewClipboardApp:
             ("常に手前へ表示", self.always_on_top_var),
             ("最小化状態で起動", self.start_minimized_var),
             ("OSログイン時に起動", self.startup_var),
+            ("Ctrlキー2回でも画面表示", self.double_ctrl_var),
         ]
         for index, (label, variable) in enumerate(checks):
             ttk.Checkbutton(advanced, text=label, variable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 25), pady=3)
-        ttk.Label(advanced, text="フォントサイズ").grid(row=3, column=0, sticky="w", pady=(8, 3))
-        ttk.Spinbox(advanced, from_=8, to=24, textvariable=self.font_size_var, width=8).grid(row=4, column=0, sticky="w")
-        ttk.Label(advanced, text="配色").grid(row=3, column=1, sticky="w", pady=(8, 3))
-        ttk.Combobox(advanced, textvariable=self.theme_var, values=list(THEMES), state="readonly", width=15).grid(row=4, column=1, sticky="w")
+        check_rows = (len(checks) + 1) // 2
+        ttk.Label(advanced, text="フォントサイズ").grid(row=check_rows, column=0, sticky="w", pady=(8, 3))
+        ttk.Spinbox(advanced, from_=8, to=24, textvariable=self.font_size_var, width=8).grid(row=check_rows + 1, column=0, sticky="w")
+        ttk.Label(advanced, text="配色").grid(row=check_rows, column=1, sticky="w", pady=(8, 3))
+        ttk.Combobox(advanced, textvariable=self.theme_var, values=list(THEMES), state="readonly", width=15).grid(row=check_rows + 1, column=1, sticky="w")
 
         portability = ttk.LabelFrame(self.settings_tab, text="CSV・バックアップ", padding=12)
         portability.pack(fill="x")
@@ -306,26 +323,35 @@ class NewClipboardApp:
         if self.closing:
             return
         text = self._read_clipboard()
-        if text and text != self.last_clipboard:
+        token = clipboard_change_token()
+        changed = token != self.last_clipboard_token if token is not None else text != self.last_clipboard
+        if changed:
+            self.last_clipboard_token = token
             self.last_clipboard = text
             if self.monitor_enabled:
-                auto_rules = [rule for rule in self.config.get("transforms", []) if rule.get("auto")]
-                try:
-                    transformed = apply_enabled(text, auto_rules)
-                except (ValueError, re.error) as error:
-                    transformed = text
-                    self.status_var.set(f"自動整形エラー: {error}")
-                if transformed != text:
-                    text = transformed
-                    pyperclip.copy(text)
-                    self.last_clipboard = text
-                self.history.add(text)
+                image = read_clipboard_image()
+                if image is not None:
+                    relative, width, height = self.store.save_image(image)
+                    self.history.add_image(relative, width, height)
+                    self.status_var.set(f"画像を履歴へ保存しました（{width}×{height}）")
+                elif text:
+                    auto_rules = [rule for rule in self.config.get("transforms", []) if rule.get("auto")]
+                    try:
+                        transformed = apply_enabled(text, auto_rules)
+                    except (ValueError, re.error) as error:
+                        transformed = text
+                        self.status_var.set(f"自動整形エラー: {error}")
+                    if transformed != text:
+                        text = transformed
+                        pyperclip.copy(text)
+                        self.last_clipboard = text
+                    self.history.add(text)
+                    if self.fifo_enabled and text != self.ignore_fifo_text:
+                        self.fifo.append(text)
+                    if text == self.ignore_fifo_text:
+                        self.ignore_fifo_text = None
                 if self.config["settings"].get("save_history", True):
                     self.store.save_history(self.history)
-                if self.fifo_enabled and text != self.ignore_fifo_text:
-                    self.fifo.append(text)
-                if text == self.ignore_fifo_text:
-                    self.ignore_fifo_text = None
                 self._refresh_history()
                 self._refresh_fifo()
         try:
@@ -380,8 +406,12 @@ class NewClipboardApp:
         self.history_list.delete(0, "end")
         colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
         for index, item in enumerate(self.visible_history):
-            preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
-            self.history_list.insert("end", preview[:180])
+            if item.kind == "image":
+                preview = f"[画像] {item.width}×{item.height}  {Path(item.image_path).name[:12]}"
+            else:
+                preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
+            prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
+            self.history_list.insert("end", prefix + preview[:180])
             self.history_list.itemconfigure(
                 index,
                 background=colors["stripe"] if index % 2 else colors["background"],
@@ -397,16 +427,81 @@ class NewClipboardApp:
     def _selected_histories(self):
         return [self.visible_history[index] for index in self.history_list.curselection()]
 
+    def _history_single_click(self, event) -> None:
+        index = self.history_list.nearest(event.y)
+        bounds = self.history_list.bbox(index) if self.history_list.size() else None
+        on_row = bool(bounds and bounds[1] <= event.y <= bounds[1] + bounds[3])
+        if on_row and not event.state & 0x5 and self.config["settings"].get("auto_paste", True):
+            self.root.after_idle(self._paste_selected_history)
+
+    def _history_right_click(self, event):
+        index = self.history_list.nearest(event.y)
+        if 0 <= index < self.history_list.size():
+            self.history_list.selection_clear(0, "end")
+            self.history_list.selection_set(index)
+        return "break"
+
+    def _snippet_single_click(self, event) -> None:
+        if self.snippet_tree.identify_row(event.y) and not event.state & 0x5 and self.config["settings"].get("auto_paste", True):
+            self.root.after_idle(self._paste_selected_snippet)
+
+    def _snippet_right_click(self, event):
+        item_id = self.snippet_tree.identify_row(event.y)
+        if item_id:
+            self.snippet_tree.selection_set(item_id)
+        return "break"
+
+    def _quick_select(self, event):
+        focus = self.root.focus_get()
+        if focus and focus.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox"}:
+            return None
+        if event.state & 0x2000C:
+            return None
+        key = (event.char or "").lower()
+        if key not in QUICK_KEYS:
+            return None
+        index = QUICK_KEYS.index(key)
+        selected_tab = self.tabs.select()
+        if selected_tab == str(self.history_tab) and index < len(self.visible_history):
+            self.history_list.selection_clear(0, "end")
+            self.history_list.selection_set(index)
+            self.history_list.see(index)
+            self._paste_selected_history()
+            return "break"
+        if selected_tab == str(self.snippet_tab) and index < len(getattr(self, "visible_snippets", [])):
+            snippet = self.visible_snippets[index]
+            self.snippet_tree.selection_set(snippet["id"])
+            self.snippet_tree.see(snippet["id"])
+            self._paste_selected_snippet()
+            return "break"
+        return None
+
     def _copy_selected_history(self) -> None:
         item = self._selected_history()
         if item:
-            self._set_clipboard(item.text)
-            self.status_var.set("履歴をクリップボードへコピーしました")
+            if item.kind == "image":
+                try:
+                    write_clipboard_image(self.store.image_path(item.image_path))
+                    self.status_var.set("画像をクリップボードへコピーしました")
+                except (ImportError, OSError, RuntimeError, ValueError) as error:
+                    messagebox.showerror("画像履歴", str(error))
+            else:
+                self._set_clipboard(item.text)
+                self.status_var.set("履歴をクリップボードへコピーしました")
 
     def _paste_selected_history(self) -> None:
         item = self._selected_history()
         if item:
-            self._paste_text(item.text)
+            if item.kind == "image":
+                try:
+                    write_clipboard_image(self.store.image_path(item.image_path))
+                except (ImportError, OSError, RuntimeError, ValueError) as error:
+                    messagebox.showerror("画像履歴", str(error))
+                    return
+                if self.config["settings"].get("auto_paste", True):
+                    self._send_paste()
+            else:
+                self._paste_text(item.text)
 
     def _delete_history(self) -> None:
         item = self._selected_history()
@@ -425,7 +520,7 @@ class NewClipboardApp:
 
     def _edit_history(self) -> None:
         item = self._selected_history()
-        if not item:
+        if not item or item.kind != "text":
             return
         value = self._text_dialog("履歴の編集", item.text)
         if value is None:
@@ -439,7 +534,7 @@ class NewClipboardApp:
 
     def _split_history_lines(self) -> None:
         item = self._selected_history()
-        if not item:
+        if not item or item.kind != "text":
             return
         lines = [line for line in item.text.splitlines() if line]
         for line in reversed(lines):
@@ -451,7 +546,10 @@ class NewClipboardApp:
         items = self._selected_histories()
         if not items:
             return
-        value = "\n".join(item.text for item in items)
+        text_items = [item for item in items if item.kind == "text"]
+        if not text_items:
+            return
+        value = "\n".join(item.text for item in text_items)
         self.history.add(value)
         self.store.save_history(self.history)
         self._set_clipboard(value)
@@ -507,12 +605,15 @@ class NewClipboardApp:
         if not group:
             return
         needle = self.snippet_search_var.get().strip().casefold()
+        self.visible_snippets = []
         for snippet in group.get("snippets", []):
             haystack = "\n".join((snippet.get("title", ""), snippet.get("memo", ""), snippet.get("text", ""))).casefold()
             if needle and needle not in haystack:
                 continue
+            self.visible_snippets.append(snippet)
             preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")[:120]
-            self.snippet_tree.insert("", "end", iid=snippet["id"], values=(snippet["title"], snippet.get("memo", ""), preview, snippet.get("hotkey", "")))
+            index = len(self.visible_snippets) - 1
+            self.snippet_tree.insert("", "end", iid=snippet["id"], values=(quick_key(index), snippet["title"], snippet.get("memo", ""), preview, snippet.get("hotkey", "")))
 
     def _selected_snippet(self) -> dict | None:
         group = self._selected_group()
@@ -655,6 +756,9 @@ class NewClipboardApp:
         if not self.config["settings"].get("auto_paste", True):
             self.status_var.set("クリップボードへセットしました")
             return
+        self._send_paste()
+
+    def _send_paste(self) -> None:
         self.hide_window()
 
         def send_paste() -> None:
@@ -909,6 +1013,7 @@ class NewClipboardApp:
         self.always_on_top_var.set(settings.get("always_on_top", False))
         self.start_minimized_var.set(settings.get("start_minimized", False))
         self.startup_var.set(startup_enabled())
+        self.double_ctrl_var.set(settings.get("double_ctrl_popup", True))
         self._apply_appearance()
 
     def _save_settings(self) -> None:
@@ -935,6 +1040,7 @@ class NewClipboardApp:
         settings["clear_history_on_exit"] = self.clear_history_var.get()
         settings["always_on_top"] = self.always_on_top_var.get()
         settings["start_minimized"] = self.start_minimized_var.get()
+        settings["double_ctrl_popup"] = self.double_ctrl_var.get()
         self.history.limit = limit
         try:
             self._save_config(restart_hotkeys=True)
@@ -1033,7 +1139,10 @@ class NewClipboardApp:
     def _restart_hotkeys(self) -> None:
         if self.hotkeys:
             self.hotkeys.stop()
-        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings())
+        double_ctrl_callback = None
+        if self.config["settings"].get("double_ctrl_popup", True):
+            double_ctrl_callback = lambda: self.events.put(("show", None))
+        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings(), double_ctrl_callback)
         try:
             self.hotkeys.start()
         except Exception as error:
