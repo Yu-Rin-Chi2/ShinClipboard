@@ -24,9 +24,9 @@ from .transforms import apply_enabled, apply_transform
 
 
 THEMES = {
-    "blue": {"background": "#eff6ff", "accent": "#2563eb", "foreground": "#172033"},
-    "dark": {"background": "#1f2937", "accent": "#38bdf8", "foreground": "#f8fafc"},
-    "green": {"background": "#ecfdf5", "accent": "#059669", "foreground": "#15332b"},
+    "blue": {"background": "#f8fbff", "stripe": "#e7f0ff", "accent": "#2563eb", "foreground": "#172033"},
+    "dark": {"background": "#1f2937", "stripe": "#2d3a4d", "accent": "#38bdf8", "foreground": "#f8fafc"},
+    "green": {"background": "#f6fffb", "stripe": "#dcf7eb", "accent": "#059669", "foreground": "#15332b"},
 }
 
 
@@ -371,9 +371,17 @@ class NewClipboardApp:
             return
         self.visible_history = self.history.search(self.search_var.get())
         self.history_list.delete(0, "end")
-        for item in self.visible_history:
+        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        for index, item in enumerate(self.visible_history):
             preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
             self.history_list.insert("end", preview[:180])
+            self.history_list.itemconfigure(
+                index,
+                background=colors["stripe"] if index % 2 else colors["background"],
+                foreground=colors["foreground"],
+                selectbackground=colors["accent"],
+                selectforeground="#ffffff",
+            )
 
     def _selected_history(self):
         selected = self.history_list.curselection()
@@ -970,6 +978,7 @@ class NewClipboardApp:
                 widget.configure(font=("Yu Gothic UI", size), background=colors["background"], foreground=colors["foreground"], selectbackground=colors["accent"])
         style = ttk.Style()
         style.configure("Treeview", font=("Yu Gothic UI", size), rowheight=max(24, size * 2 + 4))
+        self._refresh_history()
 
     def _export_snippets_csv(self) -> None:
         path = filedialog.asksaveasfilename(title="定型文CSV出力", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
