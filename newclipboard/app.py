@@ -1061,13 +1061,14 @@ class NewClipboardApp:
     def _hotkey_mappings(self) -> dict[str, object]:
         settings = self.config["settings"]
         mappings = {
-            settings["popup_hotkey"]: lambda: self.events.put(("show", None)),
             settings["fifo_toggle_hotkey"]: lambda: self.events.put(("toggle_fifo", None)),
             settings["lifo_toggle_hotkey"]: lambda: self.events.put(("toggle_lifo", None)),
             settings["monitor_toggle_hotkey"]: lambda: self.events.put(("toggle_monitor", None)),
             "primary+v": self._fifo_paste_hotkey,
             "primary+shift+z": lambda: self.events.put(("undo_fifo", None)),
         }
+        if settings["popup_hotkey"] != "ctrl+space":
+            mappings[settings["popup_hotkey"]] = lambda: self.events.put(("show", None))
         for group in self.config["groups"]:
             for snippet in group.get("snippets", []):
                 if snippet.get("hotkey"):
@@ -1142,7 +1143,10 @@ class NewClipboardApp:
         double_ctrl_callback = None
         if self.config["settings"].get("double_ctrl_popup", True):
             double_ctrl_callback = lambda: self.events.put(("show", None))
-        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings(), double_ctrl_callback)
+        ctrl_space_callback = None
+        if self.config["settings"].get("popup_hotkey") == "ctrl+space":
+            ctrl_space_callback = lambda: self.events.put(("show", None))
+        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings(), double_ctrl_callback, ctrl_space_callback)
         try:
             self.hotkeys.start()
         except Exception as error:

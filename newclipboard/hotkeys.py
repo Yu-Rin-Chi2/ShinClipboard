@@ -46,9 +46,15 @@ class DoubleTapDetector:
 
 
 class GlobalHotkeyService:
-    def __init__(self, mappings: dict[str, Callable[[], None]], on_double_ctrl: Callable[[], None] | None = None):
+    def __init__(
+        self,
+        mappings: dict[str, Callable[[], None]],
+        on_double_ctrl: Callable[[], None] | None = None,
+        on_ctrl_space: Callable[[], None] | None = None,
+    ):
         self.mappings = mappings
         self.on_double_ctrl = on_double_ctrl
+        self.on_ctrl_space = on_ctrl_space
         self.listener = None
         self.double_ctrl_listener = None
         self._double_ctrl = DoubleTapDetector()
@@ -62,14 +68,18 @@ class GlobalHotkeyService:
                 converted[portable_to_pynput(hotkey)] = callback
         self.listener = keyboard.GlobalHotKeys(converted)
         self.listener.start()
-        if self.on_double_ctrl:
+        if self.on_double_ctrl or self.on_ctrl_space:
             ctrl_keys = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 
             def on_press(key) -> None:
+                if key == keyboard.Key.space and self._double_ctrl.is_down and self.on_ctrl_space:
+                    self.on_ctrl_space()
+                    return
                 if key not in ctrl_keys:
                     return
                 if self._double_ctrl.press():
-                    self.on_double_ctrl()
+                    if self.on_double_ctrl:
+                        self.on_double_ctrl()
 
             def on_release(key) -> None:
                 if key in ctrl_keys:
