@@ -89,6 +89,7 @@ class NewClipboardApp:
 
         self._configure_window()
         self._build_ui()
+        self._build_call_window()
         self._load_settings_fields()
         self._refresh_all()
         self._restart_hotkeys()
@@ -99,11 +100,10 @@ class NewClipboardApp:
             self.root.withdraw()
 
     def _configure_window(self) -> None:
-        self.root.title("NewClipboard")
+        self.root.title("NewClipboard - 設定・編集")
         self.root.geometry("920x720")
         self.root.minsize(720, 500)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
-        self.root.bind("<KeyPress>", self._quick_select)
         icon_png = resource_path("assets/newclipboard-512.png")
         if icon_png.exists():
             self.window_icon = tk.PhotoImage(file=icon_png)
@@ -140,6 +140,46 @@ class NewClipboardApp:
         self._build_settings_tab()
         ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4)).pack(fill="x")
 
+    def _build_call_window(self) -> None:
+        self.call_window = tk.Toplevel(self.root)
+        self.call_window.title("NewClipboard - 貼り付け")
+        self.call_window.geometry("520x340")
+        self.call_window.minsize(340, 200)
+        self.call_window.protocol("WM_DELETE_WINDOW", self.hide_call_window)
+        self.call_window.bind("<Escape>", lambda _: self.hide_call_window())
+        self.call_window.bind("<KeyPress>", self._quick_select)
+
+        self.call_tabs = ttk.Notebook(self.call_window)
+        self.call_tabs.pack(fill="both", expand=True, padx=6, pady=6)
+        history_frame = ttk.Frame(self.call_tabs, padding=2)
+        snippet_frame = ttk.Frame(self.call_tabs, padding=2)
+        self.call_tabs.add(history_frame, text="履歴")
+        self.call_tabs.add(snippet_frame, text="定型文")
+        self.call_tabs.bind("<<NotebookTabChanged>>", self._focus_call_list)
+
+        self.call_history_list = tk.Listbox(
+            history_frame,
+            activestyle="none",
+            exportselection=False,
+            font=("Yu Gothic UI", 11),
+            selectborderwidth=0,
+        )
+        self.call_history_list.pack(fill="both", expand=True)
+        self.call_history_list.bind("<ButtonRelease-1>", self._call_history_click)
+        self.call_history_list.bind("<Return>", lambda _: self._paste_call_history())
+
+        self.call_snippet_list = tk.Listbox(
+            snippet_frame,
+            activestyle="none",
+            exportselection=False,
+            font=("Yu Gothic UI", 11),
+            selectborderwidth=0,
+        )
+        self.call_snippet_list.pack(fill="both", expand=True)
+        self.call_snippet_list.bind("<ButtonRelease-1>", self._call_snippet_click)
+        self.call_snippet_list.bind("<Return>", lambda _: self._paste_call_snippet())
+        self.call_window.withdraw()
+
     def _build_history_tab(self) -> None:
         top = ttk.Frame(self.history_tab)
         top.pack(fill="x", pady=(0, 8))
@@ -158,7 +198,6 @@ class NewClipboardApp:
             selectmode="extended",
         )
         self.history_list.pack(fill="both", expand=True)
-        self.history_list.bind("<ButtonRelease-1>", self._history_single_click)
         self.history_list.bind("<Button-3>", self._history_right_click)
         self.history_list.bind("<Return>", lambda _: self._paste_selected_history())
         bar = ttk.Frame(self.history_tab)
@@ -193,19 +232,16 @@ class NewClipboardApp:
         ttk.Label(snippet_search, text="定型文検索").pack(side="left")
         ttk.Entry(snippet_search, textvariable=self.snippet_search_var).pack(side="left", fill="x", expand=True, padx=8)
         self.snippet_search_var.trace_add("write", lambda *_: self._refresh_snippets())
-        self.snippet_tree = ttk.Treeview(right, columns=("key", "title", "memo", "preview", "hotkey"), show="headings")
-        self.snippet_tree.heading("key", text="キー")
+        self.snippet_tree = ttk.Treeview(right, columns=("title", "memo", "preview", "hotkey"), show="headings")
         self.snippet_tree.heading("title", text="名前")
         self.snippet_tree.heading("memo", text="メモ")
         self.snippet_tree.heading("preview", text="内容")
         self.snippet_tree.heading("hotkey", text="ショートカット")
-        self.snippet_tree.column("key", width=45, anchor="center", stretch=False)
         self.snippet_tree.column("title", width=150)
         self.snippet_tree.column("memo", width=120)
         self.snippet_tree.column("preview", width=250)
         self.snippet_tree.column("hotkey", width=150)
         self.snippet_tree.pack(fill="both", expand=True, pady=6)
-        self.snippet_tree.bind("<ButtonRelease-1>", self._snippet_single_click)
         self.snippet_tree.bind("<Button-3>", self._snippet_right_click)
         self.snippet_tree.bind("<Return>", lambda _: self._paste_selected_snippet())
         bar = ttk.Frame(right)
@@ -359,6 +395,8 @@ class NewClipboardApp:
                 event, payload = self.events.get_nowait()
                 if event == "show":
                     self.show_window()
+                elif event == "show_settings":
+                    self.show_settings_window()
                 elif event == "refresh_fifo":
                     self._refresh_fifo()
                 elif event == "toggle_fifo":
@@ -398,6 +436,7 @@ class NewClipboardApp:
         self._refresh_groups()
         self._refresh_fifo()
         self._refresh_transforms()
+        self._refresh_call_window()
 
     def _refresh_history(self) -> None:
         if not hasattr(self, "history_list"):
@@ -410,8 +449,7 @@ class NewClipboardApp:
                 preview = f"[画像] {item.width}×{item.height}  {Path(item.image_path).name[:12]}"
             else:
                 preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
-            prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
-            self.history_list.insert("end", prefix + preview[:180])
+            self.history_list.insert("end", preview[:180])
             self.history_list.itemconfigure(
                 index,
                 background=colors["stripe"] if index % 2 else colors["background"],
@@ -419,6 +457,54 @@ class NewClipboardApp:
                 selectbackground=colors["accent"],
                 selectforeground="#ffffff",
             )
+        self._refresh_call_history()
+
+    def _refresh_call_window(self) -> None:
+        self._refresh_call_history()
+        self._refresh_call_snippets()
+
+    def _refresh_call_history(self) -> None:
+        if not hasattr(self, "call_history_list"):
+            return
+        self.call_history_items = self.history.search()
+        self.call_history_list.delete(0, "end")
+        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        for index, item in enumerate(self.call_history_items):
+            if item.kind == "image":
+                preview = f"[画像] {item.width}×{item.height}"
+            else:
+                preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
+            prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
+            self.call_history_list.insert("end", prefix + preview[:160])
+            self.call_history_list.itemconfigure(
+                index,
+                background=colors["stripe"] if index % 2 else colors["background"],
+                foreground=colors["foreground"],
+                selectbackground=colors["accent"],
+                selectforeground="#ffffff",
+            )
+
+    def _refresh_call_snippets(self) -> None:
+        if not hasattr(self, "call_snippet_list"):
+            return
+        self.call_snippet_items = []
+        self.call_snippet_list.delete(0, "end")
+        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        for group in self.config["groups"]:
+            for snippet in group.get("snippets", []):
+                index = len(self.call_snippet_items)
+                self.call_snippet_items.append(snippet)
+                preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")
+                prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
+                label = f"{prefix}[{group['name']}] {snippet['title']}  —  {preview[:110]}"
+                self.call_snippet_list.insert("end", label)
+                self.call_snippet_list.itemconfigure(
+                    index,
+                    background=colors["stripe"] if index % 2 else colors["background"],
+                    foreground=colors["foreground"],
+                    selectbackground=colors["accent"],
+                    selectforeground="#ffffff",
+                )
 
     def _selected_history(self):
         selected = self.history_list.curselection()
@@ -427,23 +513,12 @@ class NewClipboardApp:
     def _selected_histories(self):
         return [self.visible_history[index] for index in self.history_list.curselection()]
 
-    def _history_single_click(self, event) -> None:
-        index = self.history_list.nearest(event.y)
-        bounds = self.history_list.bbox(index) if self.history_list.size() else None
-        on_row = bool(bounds and bounds[1] <= event.y <= bounds[1] + bounds[3])
-        if on_row and not event.state & 0x5 and self.config["settings"].get("auto_paste", True):
-            self.root.after_idle(self._paste_selected_history)
-
     def _history_right_click(self, event):
         index = self.history_list.nearest(event.y)
         if 0 <= index < self.history_list.size():
             self.history_list.selection_clear(0, "end")
             self.history_list.selection_set(index)
         return "break"
-
-    def _snippet_single_click(self, event) -> None:
-        if self.snippet_tree.identify_row(event.y) and not event.state & 0x5 and self.config["settings"].get("auto_paste", True):
-            self.root.after_idle(self._paste_selected_snippet)
 
     def _snippet_right_click(self, event):
         item_id = self.snippet_tree.identify_row(event.y)
@@ -452,7 +527,7 @@ class NewClipboardApp:
         return "break"
 
     def _quick_select(self, event):
-        focus = self.root.focus_get()
+        focus = self.call_window.focus_get()
         if focus and focus.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox"}:
             return None
         if event.state & 0x2000C:
@@ -461,20 +536,71 @@ class NewClipboardApp:
         if key not in QUICK_KEYS:
             return None
         index = QUICK_KEYS.index(key)
-        selected_tab = self.tabs.select()
-        if selected_tab == str(self.history_tab) and index < len(self.visible_history):
-            self.history_list.selection_clear(0, "end")
-            self.history_list.selection_set(index)
-            self.history_list.see(index)
-            self._paste_selected_history()
+        selected_tab = self.call_tabs.select()
+        if selected_tab == self.call_tabs.tabs()[0] and index < len(self.call_history_items):
+            self.call_history_list.selection_clear(0, "end")
+            self.call_history_list.selection_set(index)
+            self.call_history_list.see(index)
+            self._paste_call_history()
             return "break"
-        if selected_tab == str(self.snippet_tab) and index < len(getattr(self, "visible_snippets", [])):
-            snippet = self.visible_snippets[index]
-            self.snippet_tree.selection_set(snippet["id"])
-            self.snippet_tree.see(snippet["id"])
-            self._paste_selected_snippet()
+        if selected_tab == self.call_tabs.tabs()[1] and index < len(self.call_snippet_items):
+            self.call_snippet_list.selection_clear(0, "end")
+            self.call_snippet_list.selection_set(index)
+            self.call_snippet_list.see(index)
+            self._paste_call_snippet()
             return "break"
         return None
+
+    def _focus_call_list(self, _event=None) -> None:
+        if not hasattr(self, "call_tabs"):
+            return
+        widget = self.call_history_list if self.call_tabs.index("current") == 0 else self.call_snippet_list
+        if widget.size() and not widget.curselection():
+            widget.selection_set(0)
+        self.call_window.after_idle(widget.focus_set)
+
+    @staticmethod
+    def _clicked_list_row(widget: tk.Listbox, y: int) -> int | None:
+        if not widget.size():
+            return None
+        index = widget.nearest(y)
+        bounds = widget.bbox(index)
+        return index if bounds and bounds[1] <= y <= bounds[1] + bounds[3] else None
+
+    def _call_history_click(self, event) -> None:
+        index = self._clicked_list_row(self.call_history_list, event.y)
+        if index is not None:
+            self.call_history_list.selection_clear(0, "end")
+            self.call_history_list.selection_set(index)
+            self.call_window.after_idle(self._paste_call_history)
+
+    def _call_snippet_click(self, event) -> None:
+        index = self._clicked_list_row(self.call_snippet_list, event.y)
+        if index is not None:
+            self.call_snippet_list.selection_clear(0, "end")
+            self.call_snippet_list.selection_set(index)
+            self.call_window.after_idle(self._paste_call_snippet)
+
+    def _paste_call_history(self) -> None:
+        selected = self.call_history_list.curselection()
+        if not selected:
+            return
+        item = self.call_history_items[selected[0]]
+        if item.kind == "image":
+            try:
+                write_clipboard_image(self.store.image_path(item.image_path))
+            except (ImportError, OSError, RuntimeError, ValueError) as error:
+                messagebox.showerror("画像履歴", str(error), parent=self.call_window)
+                return
+            if self.config["settings"].get("auto_paste", True):
+                self._send_paste()
+        else:
+            self._paste_text(item.text)
+
+    def _paste_call_snippet(self) -> None:
+        selected = self.call_snippet_list.curselection()
+        if selected:
+            self._paste_text(self.call_snippet_items[selected[0]]["text"])
 
     def _copy_selected_history(self) -> None:
         item = self._selected_history()
@@ -603,6 +729,8 @@ class NewClipboardApp:
             self.snippet_tree.delete(item)
         group = self._selected_group()
         if not group:
+            self.visible_snippets = []
+            self._refresh_call_snippets()
             return
         needle = self.snippet_search_var.get().strip().casefold()
         self.visible_snippets = []
@@ -612,8 +740,8 @@ class NewClipboardApp:
                 continue
             self.visible_snippets.append(snippet)
             preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")[:120]
-            index = len(self.visible_snippets) - 1
-            self.snippet_tree.insert("", "end", iid=snippet["id"], values=(quick_key(index), snippet["title"], snippet.get("memo", ""), preview, snippet.get("hotkey", "")))
+            self.snippet_tree.insert("", "end", iid=snippet["id"], values=(snippet["title"], snippet.get("memo", ""), preview, snippet.get("hotkey", "")))
+        self._refresh_call_snippets()
 
     def _selected_snippet(self) -> dict | None:
         group = self._selected_group()
@@ -1085,8 +1213,10 @@ class NewClipboardApp:
         size = int(settings.get("font_size", 11))
         colors = THEMES.get(settings.get("theme", "blue"), THEMES["blue"])
         self.root.configure(background=colors["background"])
+        if hasattr(self, "call_window"):
+            self.call_window.configure(background=colors["background"])
         self.root.attributes("-topmost", bool(settings.get("always_on_top", False)))
-        for widget_name in ("history_list", "group_list", "fifo_list"):
+        for widget_name in ("history_list", "group_list", "fifo_list", "call_history_list", "call_snippet_list"):
             widget = getattr(self, widget_name, None)
             if widget:
                 widget.configure(font=("Yu Gothic UI", size), background=colors["background"], foreground=colors["foreground"], selectbackground=colors["accent"])
@@ -1172,6 +1302,15 @@ class NewClipboardApp:
             messagebox.showerror("読み込みエラー", str(error))
 
     def show_window(self) -> None:
+        self._refresh_call_window()
+        self.call_window.deiconify()
+        self.call_window.lift()
+        self.call_window.attributes("-topmost", True)
+        self.call_window.after(80, lambda: self.call_window.attributes("-topmost", False))
+        self.call_window.focus_force()
+        self._focus_call_list()
+
+    def show_settings_window(self) -> None:
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -1179,7 +1318,12 @@ class NewClipboardApp:
         self.root.after(80, lambda: self.root.attributes("-topmost", keep_top))
         self.root.focus_force()
 
+    def hide_call_window(self) -> None:
+        self.call_window.withdraw()
+
     def hide_window(self) -> None:
+        if hasattr(self, "call_window"):
+            self.call_window.withdraw()
         self.root.withdraw()
 
     def toggle_monitor(self) -> None:
@@ -1194,7 +1338,8 @@ class NewClipboardApp:
 
             image = Image.open(resource_path("assets/newclipboard.png"))
             menu = pystray.Menu(
-                pystray.MenuItem("開く", lambda *_: self.events.put(("show", None)), default=True),
+                pystray.MenuItem("貼り付け候補を開く", lambda *_: self.events.put(("show", None)), default=True),
+                pystray.MenuItem("設定・編集を開く", lambda *_: self.events.put(("show_settings", None))),
                 pystray.MenuItem("FIFO 切替", lambda *_: self.events.put(("toggle_fifo", None))),
                 pystray.MenuItem("LIFO 切替", lambda *_: self.events.put(("toggle_lifo", None))),
                 pystray.MenuItem("クリップボード監視 切替", lambda *_: self.events.put(("toggle_monitor", None))),
