@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from PIL import Image
 
 from newclipboard.core import ClipboardHistory, FifoQueue
 from newclipboard.hotkeys import DoubleTapDetector, portable_to_pynput
+from newclipboard.single_instance import SingleInstance
 from newclipboard.storage import JsonStore
 from newclipboard.transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from newclipboard.transforms import apply_transform
@@ -111,6 +113,26 @@ class HotkeyTests(unittest.TestCase):
         self.assertTrue(detector.press(1.2))
         detector.release()
         self.assertFalse(detector.press(2.0))
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_instance_notifies_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first = SingleInstance(Path(folder))
+            second = SingleInstance(Path(folder))
+            notified = threading.Event()
+            self.assertTrue(first.acquire())
+            try:
+                first.start_listener(notified.set)
+                self.assertFalse(second.acquire())
+                self.assertTrue(second.notify_existing())
+                self.assertTrue(notified.wait(1.0))
+            finally:
+                first.close()
+
+            third = SingleInstance(Path(folder))
+            self.assertTrue(third.acquire())
+            third.close()
 
 
 class TransformTests(unittest.TestCase):

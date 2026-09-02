@@ -22,6 +22,7 @@ Windows / macOS 向けの、クリップボード履歴・定型文・連続貼�
 - OS非依存のUTF-8 `config.json` を書き出し・読み込み
 - 履歴はローカルの `history.json` に分離し、設定移管時に漏らさない
 - タスクトレイ常駐
+- 多重起動防止（再実行時は既存の呼び出し画面を表示）
 
 `primary` はWindowsではCtrl、macOSではCommandへ自動変換されます。
 

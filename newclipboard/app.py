@@ -18,6 +18,7 @@ import pyperclip
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .core import FifoQueue
 from .hotkeys import GlobalHotkeyService
+from .single_instance import SingleInstance
 from .startup import set_startup, startup_enabled
 from .storage import JsonStore, default_data_dir
 from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
@@ -1422,6 +1423,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    root = tk.Tk()
-    NewClipboardApp(root, JsonStore(args.data_dir, args.config))
-    root.mainloop()
+    instance = SingleInstance(args.data_dir)
+    if not instance.acquire():
+        instance.notify_existing()
+        return
+    try:
+        root = tk.Tk()
+        app = NewClipboardApp(root, JsonStore(args.data_dir, args.config))
+        instance.start_listener(lambda: app.events.put(("show", None)))
+        root.mainloop()
+    finally:
+        instance.close()
