@@ -94,6 +94,19 @@ class StorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.image_path("../outside.png")
 
+    def test_popup_hotkey_defaults_to_none_and_legacy_ctrl_space_is_disabled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = JsonStore(Path(folder))
+            self.assertEqual(store.load_config()["settings"]["popup_hotkey"], "")
+            config = store.load_config()
+            config["settings"]["popup_hotkey"] = "Ctrl+Space"
+            store.save_config(config)
+            self.assertEqual(store.load_config()["settings"]["popup_hotkey"], "")
+            self.assertIn('"popup_hotkey": ""', store.config_path.read_text(encoding="utf-8"))
+            config["settings"]["popup_hotkey"] = "primary+shift+space"
+            store.save_config(config)
+            self.assertEqual(store.load_config()["settings"]["popup_hotkey"], "primary+shift+space")
+
 
 class HotkeyTests(unittest.TestCase):
     def test_portable_primary_hotkey(self):
@@ -113,6 +126,115 @@ class HotkeyTests(unittest.TestCase):
         self.assertTrue(detector.press(1.2))
         detector.release()
         self.assertFalse(detector.press(2.0))
+
+    def test_double_tap_is_cancelled_when_ctrl_is_used_as_a_modifier(self):
+        detector = DoubleTapDetector(interval=0.35)
+        self.assertFalse(detector.press(1.0))  # Ctrl down
+        detector.cancel()  # e.g. "c" pressed while Ctrl is held
+        detector.release()
+        self.assertFalse(detector.press(1.1))  # Ctrl down again quickly: no popup
+        detector.release()
+        self.assertTrue(detector.press(1.2))  # two bare taps still work
+
+
+class CallWindowTests(unittest.TestCase):
+    def test_keyboard_switches_tabs_and_snippet_groups(self):
+        import tkinter as tk
+
+        from newclipboard.app import NewClipboardApp
+
+        class HeadlessApp(NewClipboardApp):
+            def _start_tray(self) -> None:
+                pass
+
+            def _restart_hotkeys(self) -> None:
+                pass
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                store = JsonStore(Path(folder))
+                config = store.load_config()
+                config["groups"].append({"id": "second", "name": "二番目", "snippets": []})
+                store.save_config(config)
+                app = HeadlessApp(root, store)
+                first_group = app.call_group_id
+
+                self.assertEqual(app.call_tabs.index("current"), 0)
+                self.assertEqual(app._move_call_group(1), "break")
+                self.assertEqual(app.call_group_id, first_group)  # arrows are ignored on the history tab
+
+                app._move_call_tab(1)
+                self.assertEqual(app.call_tabs.index("current"), 1)
+                app._move_call_group(1)
+                self.assertEqual(app.call_group_id, "second")
+                app._move_call_group(1)
+                self.assertEqual(app.call_group_id, first_group)  # wraps around
+                app._move_call_group(-1)
+                self.assertEqual(app.call_group_id, "second")
+
+                app._move_call_tab(-1)
+                self.assertEqual(app.call_tabs.index("current"), 0)
+                app._move_call_tab(1)
+                self.assertEqual(app.call_tabs.index("current"), 1)
+
+                for sequence in ("<Tab>", "<Shift-Tab>", "<Left>", "<Right>", "<Control-Left>", "<Control-Right>"):
+                    self.assertTrue(app.call_window.bind(sequence), sequence)
+        finally:
+            root.destroy()
+
+    def test_only_quick_keys_paste_from_the_popup(self):
+        import tkinter as tk
+
+        from newclipboard.app import NewClipboardApp
+
+        pasted: list[str] = []
+
+        class HeadlessApp(NewClipboardApp):
+            def _start_tray(self) -> None:
+                pass
+
+            def _restart_hotkeys(self) -> None:
+                pass
+
+            def _paste_text(self, text: str) -> None:
+                pasted.append(text)
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                store = JsonStore(Path(folder))
+                app = HeadlessApp(root, store)
+                app.history.add("first")
+                app.history.add("second")  # newest first: "second" is item 1, "first" is item 2
+                app.show_window()
+                root.update()
+                if app.call_window.focus_get() is not app.call_history_list:
+                    self.skipTest("Could not focus the popup window")
+
+                for sequence in ("<Down>", "<Up>", "<Home>", "<End>", "<Shift_L>", "<Control_L>", "<space>"):
+                    app.call_history_list.event_generate(sequence)
+                    root.update()
+                self.assertEqual(pasted, [], "keys without a quick-key character must not paste")
+
+                app.call_history_list.event_generate("<KeyPress-2>")
+                root.update()
+                self.assertEqual(pasted, ["first"])
+                app.call_history_list.selection_clear(0, "end")
+                app.call_history_list.selection_set(0)
+                app.call_history_list.event_generate("<Return>")
+                root.update()
+                self.assertEqual(pasted, ["first", "second"])
+        finally:
+            root.destroy()
 
 
 class SingleInstanceTests(unittest.TestCase):

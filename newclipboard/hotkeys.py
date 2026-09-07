@@ -25,6 +25,13 @@ def portable_to_pynput(value: str) -> str:
 
 
 class DoubleTapDetector:
+    """Detects two bare taps of the same key within `interval` seconds.
+
+    A tap only counts when the key was pressed on its own; pressing any other
+    key (for example `Ctrl+C`) cancels the pending tap so that quick shortcut
+    sequences never open the popup by accident.
+    """
+
     def __init__(self, interval: float = 0.35):
         self.interval = interval
         self.last_press = 0.0
@@ -41,6 +48,10 @@ class DoubleTapDetector:
         self.last_press = current
         return False
 
+    def cancel(self) -> None:
+        """Forget the pending tap because another key was pressed."""
+        self.last_press = 0.0
+
     def release(self) -> None:
         self.is_down = False
 
@@ -50,11 +61,9 @@ class GlobalHotkeyService:
         self,
         mappings: dict[str, Callable[[], None]],
         on_double_ctrl: Callable[[], None] | None = None,
-        on_ctrl_space: Callable[[], None] | None = None,
     ):
         self.mappings = mappings
         self.on_double_ctrl = on_double_ctrl
-        self.on_ctrl_space = on_ctrl_space
         self.listener = None
         self.double_ctrl_listener = None
         self._double_ctrl = DoubleTapDetector()
@@ -68,18 +77,15 @@ class GlobalHotkeyService:
                 converted[portable_to_pynput(hotkey)] = callback
         self.listener = keyboard.GlobalHotKeys(converted)
         self.listener.start()
-        if self.on_double_ctrl or self.on_ctrl_space:
+        if self.on_double_ctrl:
             ctrl_keys = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 
             def on_press(key) -> None:
-                if key == keyboard.Key.space and self._double_ctrl.is_down and self.on_ctrl_space:
-                    self.on_ctrl_space()
-                    return
                 if key not in ctrl_keys:
+                    self._double_ctrl.cancel()
                     return
                 if self._double_ctrl.press():
-                    if self.on_double_ctrl:
-                        self.on_double_ctrl()
+                    self.on_double_ctrl()
 
             def on_release(key) -> None:
                 if key in ctrl_keys:

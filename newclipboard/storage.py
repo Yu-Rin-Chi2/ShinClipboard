@@ -16,6 +16,10 @@ from .core import ClipboardHistory, HistoryItem
 
 
 SCHEMA_VERSION = 1
+# `Ctrl+Space` used to be the default popup hotkey. It collides with IME
+# toggling on Japanese Windows and was opened by accident too often, so it is
+# no longer offered and existing configs are migrated to "no hotkey".
+LEGACY_POPUP_HOTKEY = "ctrl+space"
 
 
 def default_config() -> dict[str, Any]:
@@ -23,7 +27,7 @@ def default_config() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "settings": {
             "history_limit": 1000,
-            "popup_hotkey": "ctrl+space",
+            "popup_hotkey": "",
             "fifo_toggle_hotkey": "primary+shift+f",
             "lifo_toggle_hotkey": "primary+shift+l",
             "monitor_toggle_hotkey": "primary+shift+m",
@@ -84,6 +88,9 @@ class JsonStore:
             group.setdefault("snippets", [])
             for snippet in group["snippets"]:
                 snippet.setdefault("memo", "")
+        if str(data["settings"].get("popup_hotkey", "")).strip().lower() == LEGACY_POPUP_HOTKEY:
+            data["settings"]["popup_hotkey"] = ""
+            self.save_config(data)
         return data
 
     def save_config(self, config: dict[str, Any]) -> None:

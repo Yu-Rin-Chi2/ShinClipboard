@@ -38,10 +38,25 @@ def resource_path(relative: str) -> Path:
 
 
 QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
+CALL_WINDOW_HINT = "Tab: 履歴 ⇔ 定型文    ← →: グループ切替    1〜0 / a〜z / Enter: 貼り付け    Esc: 閉じる"
 
 
 def quick_key(index: int) -> str:
     return QUICK_KEYS[index] if 0 <= index < len(QUICK_KEYS) else ""
+
+
+def shortcut_modifier_mask() -> int:
+    """Tk `event.state` bits that mean a shortcut modifier is held.
+
+    Lock-style keys are deliberately excluded: on Windows Tk reports NumLock as
+    Mod1 (0x8), which must not disable quick selection.
+    """
+    system = platform.system()
+    if system == "Windows":
+        return 0x4 | 0x20000  # Control, Alt
+    if system == "Darwin":
+        return 0x4 | 0x8 | 0x10  # Control, Command, Option
+    return 0x4 | 0x8  # Control, Alt (Mod1)
 
 
 class NewClipboardApp:
@@ -149,9 +164,22 @@ class NewClipboardApp:
         self.call_window.protocol("WM_DELETE_WINDOW", self.hide_call_window)
         self.call_window.bind("<Escape>", lambda _: self.hide_call_window())
         self.call_window.bind("<KeyPress>", self._quick_select)
+        # Keyboard navigation works wherever the focus is inside the popup.
+        for sequence in ("<Tab>", "<Control-Tab>"):
+            self.call_window.bind(sequence, lambda _: self._move_call_tab(1))
+        for sequence in ("<Shift-Tab>", "<Control-Shift-Tab>", "<ISO_Left_Tab>"):
+            try:
+                self.call_window.bind(sequence, lambda _: self._move_call_tab(-1))
+            except tk.TclError:
+                pass
+        for sequence in ("<Left>", "<Control-Left>"):
+            self.call_window.bind(sequence, lambda _: self._move_call_group(-1))
+        for sequence in ("<Right>", "<Control-Right>"):
+            self.call_window.bind(sequence, lambda _: self._move_call_group(1))
 
+        ttk.Label(self.call_window, text=CALL_WINDOW_HINT, style="Muted.TLabel", padding=(8, 2)).pack(side="bottom", fill="x")
         self.call_tabs = ttk.Notebook(self.call_window)
-        self.call_tabs.pack(fill="both", expand=True, padx=6, pady=6)
+        self.call_tabs.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         history_frame = ttk.Frame(self.call_tabs, padding=2)
         snippet_frame = ttk.Frame(self.call_tabs, padding=2)
         self.call_tabs.add(history_frame, text="履歴")
@@ -181,8 +209,6 @@ class NewClipboardApp:
         )
         self.call_group_combo.pack(side="left", fill="x", expand=True)
         self.call_group_combo.bind("<<ComboboxSelected>>", self._call_group_changed)
-        self.call_group_combo.bind("<Control-Left>", lambda _: self._move_call_group(-1))
-        self.call_group_combo.bind("<Control-Right>", lambda _: self._move_call_group(1))
 
         self.call_snippet_list = tk.Listbox(
             snippet_frame,
@@ -194,8 +220,6 @@ class NewClipboardApp:
         self.call_snippet_list.pack(fill="both", expand=True)
         self.call_snippet_list.bind("<ButtonRelease-1>", self._call_snippet_click)
         self.call_snippet_list.bind("<Return>", lambda _: self._paste_call_snippet())
-        self.call_snippet_list.bind("<Control-Left>", lambda _: self._move_call_group(-1))
-        self.call_snippet_list.bind("<Control-Right>", lambda _: self._move_call_group(1))
         self.call_window.withdraw()
 
     def _build_history_tab(self) -> None:
@@ -295,7 +319,7 @@ class NewClipboardApp:
         form = ttk.Frame(self.settings_tab)
         form.pack(fill="x")
         rows = [
-            ("画面表示ショートカット", self.popup_hotkey_var),
+            ("画面表示ショートカット（空欄で無効）", self.popup_hotkey_var),
             ("FIFO切替ショートカット", self.fifo_hotkey_var),
             ("LIFO切替ショートカット", self.lifo_hotkey_var),
             ("監視切替ショートカット", self.monitor_hotkey_var),
@@ -328,7 +352,7 @@ class NewClipboardApp:
             ("常に手前へ表示", self.always_on_top_var),
             ("最小化状態で起動", self.start_minimized_var),
             ("OSログイン時に起動", self.startup_var),
-            ("Ctrlキー2回でも画面表示", self.double_ctrl_var),
+            ("Ctrlキー2回で画面表示", self.double_ctrl_var),
         ]
         for index, (label, variable) in enumerate(checks):
             ttk.Checkbutton(advanced, text=label, variable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 25), pady=3)
@@ -545,9 +569,16 @@ class NewClipboardApp:
             self._refresh_call_snippets()
             self._focus_call_list()
 
+    def _move_call_tab(self, offset: int):
+        tabs = self.call_tabs.tabs()
+        if tabs:
+            current = self.call_tabs.index("current")
+            self.call_tabs.select(tabs[(current + offset) % len(tabs)])
+        return "break"
+
     def _move_call_group(self, offset: int):
         groups = self.config["groups"]
-        if not groups:
+        if not groups or self.call_tabs.index("current") != 1:
             return "break"
         current = max(0, self.call_group_combo.current())
         target = (current + offset) % len(groups)
@@ -580,10 +611,12 @@ class NewClipboardApp:
         focus = self.call_window.focus_get()
         if focus and focus.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox"}:
             return None
-        if event.state & 0x2000C:
+        if event.state & shortcut_modifier_mask():
             return None
         key = (event.char or "").lower()
-        if key not in QUICK_KEYS:
+        # Keys without a character (arrows, Home, modifiers...) give an empty
+        # string, and `"" in QUICK_KEYS` is True, so require exactly one char.
+        if len(key) != 1 or key not in QUICK_KEYS:
             return None
         index = QUICK_KEYS.index(key)
         selected_tab = self.call_tabs.select()
@@ -1245,7 +1278,7 @@ class NewClipboardApp:
             "primary+v": self._fifo_paste_hotkey,
             "primary+shift+z": lambda: self.events.put(("undo_fifo", None)),
         }
-        if settings["popup_hotkey"] != "ctrl+space":
+        if settings["popup_hotkey"].strip():
             mappings[settings["popup_hotkey"]] = lambda: self.events.put(("show", None))
         for group in self.config["groups"]:
             for snippet in group.get("snippets", []):
@@ -1323,10 +1356,7 @@ class NewClipboardApp:
         double_ctrl_callback = None
         if self.config["settings"].get("double_ctrl_popup", True):
             double_ctrl_callback = lambda: self.events.put(("show", None))
-        ctrl_space_callback = None
-        if self.config["settings"].get("popup_hotkey") == "ctrl+space":
-            ctrl_space_callback = lambda: self.events.put(("show", None))
-        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings(), double_ctrl_callback, ctrl_space_callback)
+        self.hotkeys = GlobalHotkeyService(self._hotkey_mappings(), double_ctrl_callback)
         try:
             self.hotkeys.start()
         except Exception as error:
