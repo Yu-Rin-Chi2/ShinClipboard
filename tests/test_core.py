@@ -137,7 +137,23 @@ class HotkeyTests(unittest.TestCase):
         self.assertTrue(detector.press(1.2))  # two bare taps still work
 
 
+def _destroy_root(root) -> None:
+    """Destroy a Tk root without leaving `after` timers that would fire in the next interpreter.
+
+    Only the Tcl timers are cancelled here; `destroy()` still deletes the Python
+    callbacks, so every widget's command bookkeeping stays consistent.
+    """
+    try:
+        for timer in root.tk.splitlist(root.tk.call("after", "info")):
+            root.tk.call("after", "cancel", timer)
+    except Exception:
+        pass
+    root.destroy()
+
+
 class CallWindowTests(unittest.TestCase):
+    """GUI tests. They never map or focus a window, so they do not steal keyboard input."""
+
     def test_keyboard_switches_tabs_and_snippet_groups(self):
         import tkinter as tk
 
@@ -185,7 +201,7 @@ class CallWindowTests(unittest.TestCase):
                 for sequence in ("<Tab>", "<Shift-Tab>", "<Left>", "<Right>", "<Control-Left>", "<Control-Right>"):
                     self.assertTrue(app.call_window.bind(sequence), sequence)
         finally:
-            root.destroy()
+            _destroy_root(root)
 
     def test_only_quick_keys_paste_from_the_popup(self):
         import tkinter as tk
@@ -214,27 +230,157 @@ class CallWindowTests(unittest.TestCase):
                 store = JsonStore(Path(folder))
                 app = HeadlessApp(root, store)
                 app.history.add("first")
-                app.history.add("second")  # newest first: "second" is item 1, "first" is item 2
-                app.show_window()
-                root.update()
-                if app.call_window.focus_get() is not app.call_history_list:
-                    self.skipTest("Could not focus the popup window")
+                app.history.add("second")  # newest first: "second" is row 0, "first" is row 1
+                app._refresh_call_history()
 
-                for sequence in ("<Down>", "<Up>", "<Home>", "<End>", "<Shift_L>", "<Control_L>", "<space>"):
-                    app.call_history_list.event_generate(sequence)
-                    root.update()
+                def key(char: str, state: int = 0):
+                    return type("Event", (), {"char": char, "state": state})()
+
+                # Arrows, Home, Shift... arrive with an empty char; Enter, Space, Tab, Esc with a control char.
+                for char in ("", "\r", " ", "\t", "\x1b", "\x08"):
+                    self.assertIsNone(app._quick_select(key(char)), repr(char))
                 self.assertEqual(pasted, [], "keys without a quick-key character must not paste")
+                self.assertIsNone(app._quick_select(key("2", state=0x4)), "Ctrl+2 is a shortcut, not a quick key")
+                self.assertEqual(pasted, [])
 
-                app.call_history_list.event_generate("<KeyPress-2>")
-                root.update()
+                self.assertEqual(app._quick_select(key("2")), "break")
                 self.assertEqual(pasted, ["first"])
-                app.call_history_list.selection_clear(0, "end")
-                app.call_history_list.selection_set(0)
-                app.call_history_list.event_generate("<Return>")
-                root.update()
-                self.assertEqual(pasted, ["first", "second"])
+
+                rows = app.call_history_list
+                self.assertNotIn("Text", rows.bindtags(), "Text class bindings (caret, editing) are disabled")
+                for sequence in ("<Up>", "<Down>", "<Home>", "<End>", "<Prior>", "<Next>", "<Return>"):
+                    self.assertTrue(rows.bind(sequence), sequence)
         finally:
-            root.destroy()
+            _destroy_root(root)
+
+    def test_history_popup_shows_image_thumbnails(self):
+        import tkinter as tk
+
+        from newclipboard.app import NewClipboardApp
+
+        class HeadlessApp(NewClipboardApp):
+            def _start_tray(self) -> None:
+                pass
+
+            def _restart_hotkeys(self) -> None:
+                pass
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                store = JsonStore(Path(folder))
+                app = HeadlessApp(root, store)
+                relative, width, height = store.save_image(Image.new("RGB", (400, 100), "red"))
+                app.history.add_image(relative, width, height)
+                app.history.add("text")
+                app.history.add_image("images/missing.png", 10, 10)  # newest first: this is row 0
+                app._refresh_call_history()
+                rows = app.call_history_list
+
+                self.assertEqual(rows.size(), 3)
+                self.assertFalse(rows.row_has_image(0), "an unreadable image falls back to the text label")
+                self.assertFalse(rows.row_has_image(1))
+                self.assertTrue(rows.row_has_image(2))
+                self.assertEqual(len(rows.image_names()), 1)
+                thumbnail = app._thumbnails[relative]
+                self.assertEqual((thumbnail.width(), thumbnail.height()), (200, 50))
+                self.assertIn("400×100", rows.get("3.0", "3.end"))
+
+                rows.selection_set(2)
+                self.assertEqual(rows.curselection(), (2,))
+                rows._move(-1)
+                self.assertEqual(rows.curselection(), (1,))
+                rows._move(5)
+                self.assertEqual(rows.curselection(), (2,), "movement is clamped to the last row")
+
+                app.history.clear()
+                app._refresh_call_history()
+                self.assertEqual(rows.size(), 0)
+                self.assertEqual(app._thumbnails, {}, "thumbnails of removed items are evicted")
+        finally:
+            _destroy_root(root)
+
+    def test_history_rows_can_be_dragged_to_other_apps(self):
+        import tkinter as tk
+
+        from newclipboard.app import NewClipboardApp
+
+        try:
+            import tkinterdnd2  # noqa: F401
+        except ImportError:
+            self.skipTest("tkinterdnd2 is not installed")
+
+        pasted: list[bool] = []
+        hidden: list[bool] = []
+
+        class HeadlessApp(NewClipboardApp):
+            def _start_tray(self) -> None:
+                pass
+
+            def _restart_hotkeys(self) -> None:
+                pass
+
+            def _paste_call_history(self) -> None:
+                pasted.append(True)
+
+            def hide_call_window(self) -> None:
+                hidden.append(True)
+                super().hide_call_window()
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                store = JsonStore(Path(folder))
+                app = HeadlessApp(root, store)
+                self.assertTrue(app.drag_enabled, app.status_var.get())
+                rows = app.call_history_list
+                self.assertIn("TkDND_Drag1", rows.bindtags())
+                self.assertTrue(rows.bind("<Button-1>"), "the row-selecting click handler survives registration")
+
+                relative, width, height = store.save_image(Image.new("RGB", (8, 8), "blue"))
+                app.history.add_image(relative, width, height)
+                app.history.add("dragged text")
+                app._refresh_call_history()
+
+                rows.selection_clear()
+                self.assertEqual(app._drag_init(), ("refuse_drop",))
+                self.assertFalse(app._drag_active)
+                rows.selection_set(0)
+                self.assertEqual(app._drag_init(), ("copy", "DND_Text", "dragged text"))
+                rows.selection_clear()
+                rows.selection_set(1)
+                action, kind, files = app._drag_init()
+                self.assertEqual((action, kind), ("copy", "DND_Files"))
+                self.assertEqual(Path(files[0]), store.image_path(relative))
+                self.assertTrue(app._drag_active)
+
+                # A button release that arrives while a drag is in flight must not paste.
+                app._clicked_list_row = lambda widget, y: 1  # hit-testing needs a mapped window; stub it
+                click = type("Event", (), {"y": 10})()
+                app._call_history_click(click)
+                root.update()
+                self.assertEqual(pasted, [])
+
+                app._drag_end(type("Event", (), {"action": "refuse_drop"})())
+                self.assertEqual(hidden, [], "a cancelled drag keeps the popup open")
+                app._drag_end(type("Event", (), {"action": "copy"})())
+                self.assertEqual(hidden, [True], "the popup closes after a drop")
+                app._finish_drag()
+                self.assertFalse(app._drag_active)
+
+                app._call_history_click(click)
+                root.update()
+                self.assertEqual(pasted, [True], "ordinary clicks paste again once the drag is over")
+        finally:
+            _destroy_root(root)
 
 
 class SingleInstanceTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
 
 import pyperclip
+from PIL import Image, ImageTk
 
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .core import FifoQueue
@@ -23,6 +24,7 @@ from .startup import set_startup, startup_enabled
 from .storage import JsonStore, default_data_dir
 from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from .transforms import apply_enabled, apply_transform
+from .widgets import ImageListbox
 
 
 THEMES = {
@@ -38,7 +40,8 @@ def resource_path(relative: str) -> Path:
 
 
 QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
-CALL_WINDOW_HINT = "Tab: 履歴 ⇔ 定型文    ← →: グループ切替    1〜0 / a〜z / Enter: 貼り付け    Esc: 閉じる"
+CALL_WINDOW_HINT = "Tab: 履歴⇔定型文   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   ドラッグ: 他アプリへ   Esc: 閉じる"
+THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
 
 
 def quick_key(index: int) -> str:
@@ -80,6 +83,7 @@ class NewClipboardApp:
         self.hotkeys: GlobalHotkeyService | None = None
         self.tray = None
         self.closing = False
+        self._thumbnails: dict[str, ImageTk.PhotoImage] = {}
 
         self.search_var = tk.StringVar()
         self.snippet_search_var = tk.StringVar()
@@ -186,16 +190,11 @@ class NewClipboardApp:
         self.call_tabs.add(snippet_frame, text="定型文")
         self.call_tabs.bind("<<NotebookTabChanged>>", self._focus_call_list)
 
-        self.call_history_list = tk.Listbox(
-            history_frame,
-            activestyle="none",
-            exportselection=False,
-            font=("Yu Gothic UI", 11),
-            selectborderwidth=0,
-        )
+        self.call_history_list = ImageListbox(history_frame, font=("Yu Gothic UI", 11))
         self.call_history_list.pack(fill="both", expand=True)
         self.call_history_list.bind("<ButtonRelease-1>", self._call_history_click)
         self.call_history_list.bind("<Return>", lambda _: self._paste_call_history())
+        self._setup_drag_source()
 
         group_bar = ttk.Frame(snippet_frame)
         group_bar.pack(fill="x", pady=(0, 4))
@@ -512,12 +511,16 @@ class NewClipboardApp:
         self.call_history_list.delete(0, "end")
         colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
         for index, item in enumerate(self.call_history_items):
-            if item.kind == "image":
-                preview = f"[画像] {item.width}×{item.height}"
-            else:
-                preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
             prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
-            self.call_history_list.insert("end", prefix + preview[:160])
+            thumbnail = self._thumbnail(item.image_path) if item.kind == "image" else None
+            if thumbnail is not None:
+                self.call_history_list.insert("end", prefix, image=thumbnail, suffix=f" {item.width}×{item.height}")
+            else:
+                if item.kind == "image":
+                    preview = f"[画像] {item.width}×{item.height}"
+                else:
+                    preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
+                self.call_history_list.insert("end", prefix + preview[:160])
             self.call_history_list.itemconfigure(
                 index,
                 background=colors["stripe"] if index % 2 else colors["background"],
@@ -525,6 +528,23 @@ class NewClipboardApp:
                 selectbackground=colors["accent"],
                 selectforeground="#ffffff",
             )
+        referenced = {item.image_path for item in self.call_history_items if item.kind == "image"}
+        self._thumbnails = {path: photo for path, photo in self._thumbnails.items() if path in referenced}
+
+    def _thumbnail(self, image_path: str) -> ImageTk.PhotoImage | None:
+        """Return a cached, scaled-down PhotoImage for a stored image, or None if unreadable."""
+        cached = self._thumbnails.get(image_path)
+        if cached is not None:
+            return cached
+        try:
+            with Image.open(self.store.image_path(image_path)) as source:
+                image = source.convert("RGBA")
+            image.thumbnail(THUMBNAIL_SIZE)
+            photo = ImageTk.PhotoImage(image, master=self.call_window)
+        except (OSError, ValueError):
+            return None
+        self._thumbnails[image_path] = photo
+        return photo
 
     def _refresh_call_snippets(self) -> None:
         if not hasattr(self, "call_snippet_list"):
@@ -609,7 +629,11 @@ class NewClipboardApp:
 
     def _quick_select(self, event):
         focus = self.call_window.focus_get()
-        if focus and focus.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox"}:
+        if (
+            focus
+            and not isinstance(focus, ImageListbox)
+            and focus.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox"}
+        ):
             return None
         if event.state & shortcut_modifier_mask():
             return None
@@ -651,11 +675,62 @@ class NewClipboardApp:
         return index if bounds and bounds[1] <= y <= bounds[1] + bounds[3] else None
 
     def _call_history_click(self, event) -> None:
+        if self._drag_active:
+            return  # the button release belongs to a drag & drop, not a click
         index = self._clicked_list_row(self.call_history_list, event.y)
         if index is not None:
             self.call_history_list.selection_clear(0, "end")
             self.call_history_list.selection_set(index)
             self.call_window.after_idle(self._paste_call_history)
+
+    def _setup_drag_source(self) -> None:
+        """Let history rows be dragged into other applications (images as files, text as text)."""
+        self.drag_enabled = False
+        self._drag_active = False
+        try:
+            from tkinterdnd2 import TkinterDnD
+
+            TkinterDnD._require(self.root)
+            widget = self.call_history_list
+            widget.drag_source_register(1, "DND_Files", "DND_Text")
+            widget.dnd_bind("<<DragInitCmd>>", self._drag_init)
+            widget.dnd_bind("<<DragEndCmd>>", self._drag_end)
+        except (ImportError, RuntimeError, tk.TclError) as error:
+            self.status_var.set(f"ドラッグ＆ドロップは利用できません: {error}")
+            return
+        self.drag_enabled = True
+
+    def _drag_init(self, _event=None):
+        """tkdnd <<DragInitCmd>>: describe what the selected history row drops as."""
+        selected = self.call_history_list.curselection()
+        if not selected or selected[0] >= len(self.call_history_items):
+            return ("refuse_drop",)
+        item = self.call_history_items[selected[0]]
+        if item.kind == "image":
+            try:
+                path = self.store.image_path(item.image_path)
+            except ValueError:
+                return ("refuse_drop",)
+            if not path.exists():
+                return ("refuse_drop",)
+            payload = ("copy", "DND_Files", (str(path),))
+        elif item.text:
+            payload = ("copy", "DND_Text", item.text)
+        else:
+            return ("refuse_drop",)
+        self._drag_active = True
+        return payload
+
+    def _drag_end(self, event=None) -> None:
+        """tkdnd <<DragEndCmd>>: hide the popup after a successful drop."""
+        action = str(getattr(event, "action", "") or "")
+        # Keep the guard a little longer: the button release may arrive after this.
+        self.call_window.after(300, self._finish_drag)
+        if action in {"copy", "move", "link"}:
+            self.hide_call_window()
+
+    def _finish_drag(self) -> None:
+        self._drag_active = False
 
     def _call_snippet_click(self, event) -> None:
         index = self._clicked_list_row(self.call_snippet_list, event.y)
