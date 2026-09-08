@@ -10,3 +10,4 @@ dist/
 .runtime-check/
 .final-smoke/
 .image-smoke/
+.screenshot-smoke/

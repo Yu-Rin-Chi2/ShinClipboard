@@ -39,6 +39,17 @@ def default_config() -> dict[str, Any]:
             "always_on_top": False,
             "font_size": 11,
             "theme": "blue",
+            # `primary+shift+s` is "save as" in most editors, and pynput does not
+            # suppress the keys it watches, so both would fire. Alt keeps clear.
+            "screenshot_hotkey": "primary+alt+s",
+            "screenshot_delay_hotkey": "primary+alt+d",
+            "screenshot_delay_seconds": 3,
+            "screenshot_save_dir": "",
+            "screenshot_format": "png",
+            "screenshot_copy_after_save": True,
+            "screenshot_save_to_history": True,
+            "annotation_color": "#e02424",
+            "annotation_width": 4,
         },
         "transforms": [
             {"id": str(uuid4()), "name": "各行先頭に > を挿入", "type": "prefix_each_line", "params": {"prefix": "> "}, "hotkey": "", "auto": False, "enabled": True},

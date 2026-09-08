@@ -493,5 +493,293 @@ class TransferTests(unittest.TestCase):
             self.assertTrue((restored_history.parent / relative).exists())
 
 
+class ScreenshotStorageTests(unittest.TestCase):
+    def test_drag_and_drop_scratch_files_survive_the_image_cleanup(self):
+        """`cleanup_images` deletes unreferenced pictures, so exports live outside images/."""
+        from shinclipboard.editor import EXPORT_DIR, cleanup_exports
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = JsonStore(Path(folder))
+            history = ClipboardHistory(limit=10)
+            orphan = store.data_dir / "images" / "orphan.png"
+            orphan.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (4, 4), "red").save(orphan)
+            scratch = store.data_dir / EXPORT_DIR / "shinclipboard-20260908-120000.png"
+            scratch.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (4, 4), "blue").save(scratch)
+
+            store.save_history(history)
+            self.assertFalse(orphan.exists(), "unreferenced history images are still collected")
+            self.assertTrue(scratch.exists(), "a pending drag payload must not be deleted underneath it")
+
+            self.assertEqual(cleanup_exports(store.data_dir, max_age=0), 1)
+            self.assertFalse(scratch.exists())
+
+    def test_a_config_without_screenshot_keys_gains_the_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = JsonStore(Path(folder))
+            config = store.load_config()
+            for key in ("screenshot_hotkey", "screenshot_format", "annotation_color"):
+                del config["settings"][key]
+            store.save_config(config)
+            settings = store.load_config()["settings"]
+            self.assertEqual(settings["screenshot_hotkey"], "primary+alt+s")
+            self.assertEqual(settings["screenshot_format"], "png")
+            self.assertEqual(settings["annotation_color"], "#e02424")
+
+
+class ScreenshotAppTests(unittest.TestCase):
+    """GUI tests. Like the popup tests they never map or focus a window."""
+
+    def _app(self, root, folder, **overrides):
+        from shinclipboard.app import ShinClipboardApp
+
+        namespace = {"_start_tray": lambda self: None, "_restart_hotkeys": lambda self: None}
+        namespace.update(overrides)
+        headless = type("HeadlessApp", (ShinClipboardApp,), namespace)
+        return headless(root, JsonStore(Path(folder)))
+
+    def _root(self):
+        import tkinter as tk
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        return root
+
+    def test_writing_an_image_to_the_clipboard_does_not_re_add_it_to_history(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                relative, width, height = app.store.save_image(Image.new("RGB", (8, 8), "blue"))
+                app.history.add_image(relative, width, height)
+                before = len(app.history.search())
+
+                # The write reports its own token, and the clipboard still holds
+                # exactly that when the next poll looks.
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=99), \
+                        unittest.mock.patch.object(app_module, "clipboard_change_token", return_value=99), \
+                        unittest.mock.patch.object(
+                            app_module, "read_clipboard_image", return_value=Image.new("RGB", (8, 8), "green")
+                        ):
+                    app._set_clipboard_image(app.store.image_path(relative))
+                    self.assertEqual(app.last_clipboard_token, 99)
+                    app._poll()
+                self.assertEqual(len(app.history.search()), before, "our own write must not come back as a copy")
+        finally:
+            _destroy_root(root)
+
+    def test_an_image_copied_by_another_app_right_after_our_write_is_still_recorded(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                relative, width, height = app.store.save_image(Image.new("RGB", (8, 8), "blue"))
+                app.history.add_image(relative, width, height)
+                before = len(app.history.search())
+
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=99), \
+                        unittest.mock.patch.object(app_module, "clipboard_change_token", return_value=100), \
+                        unittest.mock.patch.object(
+                            app_module, "read_clipboard_image", return_value=Image.new("RGB", (9, 9), "green")
+                        ):
+                    app._set_clipboard_image(app.store.image_path(relative))
+                    app._poll()
+                self.assertEqual(len(app.history.search()), before + 1, "someone else's copy is not swallowed")
+        finally:
+            _destroy_root(root)
+
+    def test_a_history_image_opens_an_editor_that_can_save_a_new_entry(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                relative, width, height = app.store.save_image(Image.new("RGB", (40, 30), "blue"))
+                app.history.add_image(relative, width, height)
+                item = app.history.search()[0]
+
+                app._edit_image_item(item)
+                root.update()
+                self.assertEqual(len(app.editors), 1)
+                editor = next(iter(app.editors))
+                self.assertEqual(editor.base.size, (40, 30))
+
+                from shinclipboard.annotations import Shape
+
+                editor.document.shapes.append(Shape("rect", [(2, 2), (20, 20)], color="#ff0000", filled=True))
+                editor.save_to_history()
+                self.assertEqual(len(app.history.search()), 2, "the edit is a new entry, the original stays")
+                self.assertTrue(app.store.image_path(app.history.search()[0].image_path).exists())
+
+                editor.close()
+                self.assertEqual(app.editors, set())
+        finally:
+            _destroy_root(root)
+
+    def test_a_text_history_row_is_refused_by_the_image_editor(self):
+        opened: list[str] = []
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                app.history.add("just text")
+                with unittest.mock.patch("tkinter.messagebox.showinfo", lambda *a, **k: opened.append("info")):
+                    app._edit_image_item(app.history.search()[0])
+                self.assertEqual(opened, ["info"])
+                self.assertEqual(app.editors, set())
+        finally:
+            _destroy_root(root)
+
+    def test_capture_hides_our_windows_and_always_restores_them(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                # A failing selector stands in for any error during the grab; the
+                # app must never be left in capture mode with hidden windows.
+                with unittest.mock.patch("shinclipboard.app.RegionSelector") as selector:
+                    selector.return_value.start.side_effect = RuntimeError("no screen")
+                    app.start_capture()
+                    self.assertTrue(app.capturing)
+                    root.update()
+                    app._run_selector()
+                self.assertFalse(app.capturing)
+                self.assertEqual(app._hidden_for_capture, [])
+                self.assertIn("撮影できません", app.status_var.get())
+        finally:
+            _destroy_root(root)
+
+    def test_a_finished_capture_is_copied_before_the_editor_opens(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                app.capturing = True
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=7) as write:
+                    app._capture_done(Image.new("RGB", (32, 16), "red"))
+                self.assertEqual(write.call_count, 1)
+                self.assertTrue(Path(write.call_args[0][0]).exists(), "the clipboard is fed a real PNG")
+                self.assertEqual(app.last_clipboard_token, 7)
+                self.assertEqual(len(app.history.search()), 1, "the raw capture lands in the history")
+                self.assertEqual(len(app.editors), 1, "and the editor still opens")
+                self.assertFalse(app.capturing)
+                next(iter(app.editors)).close()
+        finally:
+            _destroy_root(root)
+
+    def test_a_delayed_capture_counts_down_then_captures(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                app.config["settings"]["screenshot_delay_seconds"] = 2
+                with unittest.mock.patch("shinclipboard.app.RegionSelector") as selector:
+                    app.start_delayed_capture()
+                    self.assertTrue(app.capturing)
+                    self.assertIsNotNone(app._countdown_window, "a visible countdown tells the user what is happening")
+                    self.assertIn("2 秒後", app._countdown_var.get())
+                    selector.assert_not_called()
+                    # Drive the ticks by hand instead of waiting real seconds.
+                    root.after_cancel(app._countdown_job)
+                    app._tick_countdown()
+                    root.after_cancel(app._countdown_job)
+                    self.assertIn("1 秒後", app._countdown_var.get())
+                    app._tick_countdown()
+                    self.assertIsNone(app._countdown_window, "the countdown must not end up in the picture")
+                    root.update()
+                    for _ in range(20):
+                        if selector.called:
+                            break
+                        root.after(20, root.quit)
+                        root.mainloop()
+                    selector.return_value.start.assert_called_once()
+                app._capture_done(None)
+        finally:
+            _destroy_root(root)
+
+    def test_pressing_the_hotkey_again_cancels_the_countdown(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch("shinclipboard.app.RegionSelector") as selector:
+                    app.start_capture(delay_seconds=5)
+                    self.assertIsNotNone(app._countdown_window)
+                    app.start_capture()  # either hotkey while counting down aborts
+                    self.assertIsNone(app._countdown_window)
+                    self.assertFalse(app.capturing)
+                    self.assertIn("中止", app.status_var.get())
+                    root.after(50, root.quit)
+                    root.mainloop()
+                    selector.assert_not_called()
+        finally:
+            _destroy_root(root)
+
+    def test_a_successful_capture_shows_only_the_editor(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                shown: list[str] = []
+                app.root.deiconify = lambda: shown.append("settings")
+                app.call_window.deiconify = lambda: shown.append("popup")
+                app.capturing = True
+                app._hidden_for_capture = [app.root, app.call_window]
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=1):
+                    app._capture_done(Image.new("RGB", (8, 8), "red"))
+                self.assertEqual(shown, [], "the windows hidden for the shot stay hidden")
+                self.assertEqual(len(app.editors), 1)
+                next(iter(app.editors)).close()
+
+                app.capturing = True
+                app._hidden_for_capture = [app.root, app.call_window]
+                app._capture_done(None)
+                self.assertEqual(shown, ["settings", "popup"], "an aborted shot restores what was open")
+        finally:
+            _destroy_root(root)
+
+    def test_a_second_capture_request_is_ignored_while_one_is_running(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                app.capturing = True
+                with unittest.mock.patch("shinclipboard.app.RegionSelector") as selector:
+                    app.start_capture()
+                    selector.assert_not_called()
+        finally:
+            _destroy_root(root)
+
+    def test_the_popup_binds_the_image_editor_without_stealing_the_quick_key(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                self.assertTrue(app.call_window.bind("<Control-e>"))
+                self.assertTrue(app.call_history_list.bind("<Button-3>"))
+
+                app.history.add("first")
+                app._refresh_call_history()
+                pasted: list[str] = []
+                app._paste_text = lambda text: pasted.append(text)
+                event = type("Event", (), {"char": "e", "state": 0})()
+                self.assertIsNone(app._quick_select(event), "a bare 'e' is a quick key, not the editor")
+                ctrl_event = type("Event", (), {"char": "e", "state": 0x4})()
+                self.assertIsNone(app._quick_select(ctrl_event), "Ctrl+E is left to the editor binding")
+        finally:
+            _destroy_root(root)
+
+
 if __name__ == "__main__":
     unittest.main()

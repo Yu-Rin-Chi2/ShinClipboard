@@ -16,8 +16,10 @@ from uuid import uuid4
 import pyperclip
 from PIL import Image, ImageTk
 
+from .capture_overlay import RegionSelector
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .core import FifoQueue
+from .editor import ImageEditorWindow, cleanup_exports, write_export
 from .hotkeys import GlobalHotkeyService
 from .single_instance import SingleInstance
 from .startup import migrate_legacy_startup, set_startup, startup_enabled
@@ -40,7 +42,10 @@ def resource_path(relative: str) -> Path:
 
 
 QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
-CALL_WINDOW_HINT = "Tab: 履歴⇔定型文   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   ドラッグ: 他アプリへ   Esc: 閉じる"
+CALL_WINDOW_HINT = (
+    "Tab: 履歴⇔定型文   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
+    "Ctrl+E: 画像を編集   ドラッグ: 他アプリへ   Esc: 閉じる"
+)
 THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
 
 
@@ -83,6 +88,13 @@ class ShinClipboardApp:
         self.hotkeys: GlobalHotkeyService | None = None
         self.tray = None
         self.closing = False
+        self.editors: set[ImageEditorWindow] = set()
+        self.capturing = False
+        self._selector: RegionSelector | None = None
+        self._countdown_window: tk.Toplevel | None = None
+        self._countdown_job: str | None = None
+        self._countdown_left = 0
+        self._hidden_for_capture: list[tk.Misc] = []
         self._thumbnails: dict[str, ImageTk.PhotoImage] = {}
 
         self.search_var = tk.StringVar()
@@ -106,6 +118,13 @@ class ShinClipboardApp:
         self.double_ctrl_var = tk.BooleanVar()
         self.monitor_status_var = tk.StringVar()
         self.monitor_status_var.set("監視中")
+        self.screenshot_hotkey_var = tk.StringVar()
+        self.screenshot_delay_hotkey_var = tk.StringVar()
+        self.screenshot_delay_var = tk.StringVar()
+        self.screenshot_dir_var = tk.StringVar()
+        self.screenshot_format_var = tk.StringVar()
+        self.screenshot_copy_var = tk.BooleanVar()
+        self.screenshot_history_var = tk.BooleanVar()
 
         self._configure_window()
         self._build_ui()
@@ -114,6 +133,7 @@ class ShinClipboardApp:
         self._refresh_all()
         self._restart_hotkeys()
         self._start_tray()
+        cleanup_exports(self.store.data_dir)
         self.root.after(self.POLL_MS, self._poll)
 
         if self.config["settings"].get("start_minimized"):
@@ -194,6 +214,10 @@ class ShinClipboardApp:
         self.call_history_list.pack(fill="both", expand=True)
         self.call_history_list.bind("<ButtonRelease-1>", self._call_history_click)
         self.call_history_list.bind("<Return>", lambda _: self._paste_call_history())
+        self.call_history_list.bind("<Button-3>", self._call_history_menu)
+        # Ctrl is in `shortcut_modifier_mask`, so `_quick_select` ignores this and
+        # a bare "e" still pastes as before.
+        self.call_window.bind("<Control-e>", self._edit_call_history_image)
         self._setup_drag_source()
 
         group_bar = ttk.Frame(snippet_frame)
@@ -246,6 +270,7 @@ class ShinClipboardApp:
         ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_history).pack(side="left")
         ttk.Button(bar, text="貼り付け", command=self._paste_selected_history).pack(side="left", padx=6)
         ttk.Button(bar, text="編集", command=self._edit_history).pack(side="left")
+        ttk.Button(bar, text="画像を編集", command=self._edit_selected_history_image).pack(side="left", padx=6)
         ttk.Button(bar, text="改行ごとに展開", command=self._split_history_lines).pack(side="left", padx=6)
         ttk.Button(bar, text="選択を連結", command=self._join_history).pack(side="left")
 
@@ -361,6 +386,35 @@ class ShinClipboardApp:
         ttk.Label(advanced, text="配色").grid(row=check_rows, column=1, sticky="w", pady=(8, 3))
         ttk.Combobox(advanced, textvariable=self.theme_var, values=list(THEMES), state="readonly", width=15).grid(row=check_rows + 1, column=1, sticky="w")
 
+        shots = ttk.LabelFrame(self.settings_tab, text="スクリーンショット", padding=12)
+        shots.pack(fill="x", pady=(0, 12))
+        ttk.Label(shots, text="撮影ショートカット（空欄で無効）").grid(row=0, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Entry(shots, textvariable=self.screenshot_hotkey_var, width=24).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(shots, text="ディレイ撮影ショートカット（空欄で無効）").grid(row=1, column=0, sticky="w", padx=(0, 14), pady=4)
+        delay_row = ttk.Frame(shots)
+        delay_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Entry(delay_row, textvariable=self.screenshot_delay_hotkey_var, width=24).pack(side="left")
+        ttk.Label(delay_row, text="秒数").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(delay_row, from_=1, to=60, textvariable=self.screenshot_delay_var, width=5).pack(side="left")
+        ttk.Label(shots, text="既定の保存先（空欄でピクチャ）").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Entry(shots, textvariable=self.screenshot_dir_var, width=40).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Button(shots, text="選ぶ", command=self._choose_screenshot_dir).grid(row=2, column=2, sticky="w", padx=6)
+        ttk.Label(shots, text="既定の形式").grid(row=3, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Combobox(
+            shots, textvariable=self.screenshot_format_var, values=["png", "jpeg"], state="readonly", width=10
+        ).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(shots, text="保存後にクリップボードへもコピー", variable=self.screenshot_copy_var).grid(
+            row=4, column=0, sticky="w", pady=3
+        )
+        ttk.Checkbutton(shots, text="コピーした編集結果を履歴へ残す", variable=self.screenshot_history_var).grid(
+            row=4, column=1, sticky="w", pady=3
+        )
+        ttk.Label(
+            shots,
+            text="Windows標準の Win+Shift+S とは別の機能です。ディレイ撮影はメニューやツールチップを開いてから写すときに使います。",
+            style="Muted.TLabel",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         portability = ttk.LabelFrame(self.settings_tab, text="CSV・バックアップ", padding=12)
         portability.pack(fill="x")
         ttk.Button(portability, text="定型文CSV出力", command=self._export_snippets_csv).pack(side="left")
@@ -402,6 +456,10 @@ class ShinClipboardApp:
         text = self._read_clipboard()
         token = clipboard_change_token()
         changed = token != self.last_clipboard_token if token is not None else text != self.last_clipboard
+        # While the selection overlay owns the screen, redrawing the popup would
+        # both waste work and risk pulling a withdrawn window back into view.
+        if changed and self.capturing:
+            changed = False
         if changed:
             self.last_clipboard_token = token
             self.last_clipboard = text
@@ -434,6 +492,8 @@ class ShinClipboardApp:
         try:
             while True:
                 event, payload = self.events.get_nowait()
+                if self.capturing and event in ("show", "show_settings"):
+                    continue  # a capture is in flight; nothing may steal the screen
                 if event == "show":
                     self.show_window()
                 elif event == "show_settings":
@@ -452,6 +512,12 @@ class ShinClipboardApp:
                     self._paste_text(str(payload))
                 elif event == "apply_transform":
                     self._apply_transform_by_id(str(payload))
+                elif event == "screenshot":
+                    self.start_capture()
+                elif event == "screenshot_delayed":
+                    self.start_delayed_capture()
+                elif event == "edit_clipboard_image":
+                    self.edit_clipboard_image()
                 elif event == "quit":
                     self.quit()
                     return
@@ -471,6 +537,18 @@ class ShinClipboardApp:
         if ignore_fifo:
             self.ignore_fifo_text = text
         pyperclip.copy(text)
+
+    def _set_clipboard_image(self, path: Path) -> None:
+        """Put an image on the clipboard without `_poll` filing it as a new copy.
+
+        `write_clipboard_image` reads the change token while it still holds the
+        clipboard, so the token below is unambiguously our own write. Reading the
+        token afterwards instead would also swallow anything another application
+        copied in between.
+        """
+        token = write_clipboard_image(path)
+        if token is not None:
+            self.last_clipboard_token = token
 
     def _refresh_all(self) -> None:
         self._refresh_history()
@@ -746,7 +824,7 @@ class ShinClipboardApp:
         item = self.call_history_items[selected[0]]
         if item.kind == "image":
             try:
-                write_clipboard_image(self.store.image_path(item.image_path))
+                self._set_clipboard_image(self.store.image_path(item.image_path))
             except (ImportError, OSError, RuntimeError, ValueError) as error:
                 messagebox.showerror("画像履歴", str(error), parent=self.call_window)
                 return
@@ -765,7 +843,7 @@ class ShinClipboardApp:
         if item:
             if item.kind == "image":
                 try:
-                    write_clipboard_image(self.store.image_path(item.image_path))
+                    self._set_clipboard_image(self.store.image_path(item.image_path))
                     self.status_var.set("画像をクリップボードへコピーしました")
                 except (ImportError, OSError, RuntimeError, ValueError) as error:
                     messagebox.showerror("画像履歴", str(error))
@@ -778,7 +856,7 @@ class ShinClipboardApp:
         if item:
             if item.kind == "image":
                 try:
-                    write_clipboard_image(self.store.image_path(item.image_path))
+                    self._set_clipboard_image(self.store.image_path(item.image_path))
                 except (ImportError, OSError, RuntimeError, ValueError) as error:
                     messagebox.showerror("画像履歴", str(error))
                     return
@@ -839,11 +917,14 @@ class ShinClipboardApp:
         self._set_clipboard(value)
         self._refresh_history()
 
-    def _text_dialog(self, title: str, initial: str = "") -> str | None:
-        dialog = tk.Toplevel(self.root)
+    def _text_dialog(self, title: str, initial: str = "", parent: tk.Misc | None = None) -> str | None:
+        # The editor passes its own window: the root is often withdrawn while an
+        # editor is open, and a dialog transient to a hidden window is unreachable.
+        owner = parent or self.root
+        dialog = tk.Toplevel(owner)
         dialog.title(title)
         dialog.geometry("560x360")
-        dialog.transient(self.root)
+        dialog.transient(owner)
         dialog.grab_set()
         editor = tk.Text(dialog, wrap="word", font=("Yu Gothic UI", int(self.config["settings"].get("font_size", 11))))
         editor.pack(fill="both", expand=True, padx=12, pady=12)
@@ -1300,6 +1381,13 @@ class ShinClipboardApp:
         self.start_minimized_var.set(settings.get("start_minimized", False))
         self.startup_var.set(startup_enabled())
         self.double_ctrl_var.set(settings.get("double_ctrl_popup", True))
+        self.screenshot_hotkey_var.set(settings.get("screenshot_hotkey", ""))
+        self.screenshot_delay_hotkey_var.set(settings.get("screenshot_delay_hotkey", ""))
+        self.screenshot_delay_var.set(str(settings.get("screenshot_delay_seconds", 3)))
+        self.screenshot_dir_var.set(settings.get("screenshot_save_dir", ""))
+        self.screenshot_format_var.set(settings.get("screenshot_format", "png"))
+        self.screenshot_copy_var.set(settings.get("screenshot_copy_after_save", True))
+        self.screenshot_history_var.set(settings.get("screenshot_save_to_history", True))
         self._apply_appearance()
 
     def _save_settings(self) -> None:
@@ -1327,6 +1415,17 @@ class ShinClipboardApp:
         settings["always_on_top"] = self.always_on_top_var.get()
         settings["start_minimized"] = self.start_minimized_var.get()
         settings["double_ctrl_popup"] = self.double_ctrl_var.get()
+        settings["screenshot_hotkey"] = self.screenshot_hotkey_var.get().strip().lower()
+        settings["screenshot_delay_hotkey"] = self.screenshot_delay_hotkey_var.get().strip().lower()
+        try:
+            settings["screenshot_delay_seconds"] = max(1, min(60, int(self.screenshot_delay_var.get())))
+        except ValueError:
+            messagebox.showerror("設定", "ディレイ撮影の秒数は1〜60で入力してください。")
+            return
+        settings["screenshot_save_dir"] = self.screenshot_dir_var.get().strip()
+        settings["screenshot_format"] = self.screenshot_format_var.get()
+        settings["screenshot_copy_after_save"] = self.screenshot_copy_var.get()
+        settings["screenshot_save_to_history"] = self.screenshot_history_var.get()
         self.history.limit = limit
         try:
             self._save_config(restart_hotkeys=True)
@@ -1355,6 +1454,10 @@ class ShinClipboardApp:
         }
         if settings["popup_hotkey"].strip():
             mappings[settings["popup_hotkey"]] = lambda: self.events.put(("show", None))
+        if str(settings.get("screenshot_hotkey", "")).strip():
+            mappings[settings["screenshot_hotkey"]] = lambda: self.events.put(("screenshot", None))
+        if str(settings.get("screenshot_delay_hotkey", "")).strip():
+            mappings[settings["screenshot_delay_hotkey"]] = lambda: self.events.put(("screenshot_delayed", None))
         for group in self.config["groups"]:
             for snippet in group.get("snippets", []):
                 if snippet.get("hotkey"):
@@ -1381,6 +1484,11 @@ class ShinClipboardApp:
         style = ttk.Style()
         style.configure("Treeview", font=("Yu Gothic UI", size), rowheight=max(24, size * 2 + 4))
         self._refresh_history()
+
+    def _choose_screenshot_dir(self) -> None:
+        folder = filedialog.askdirectory(title="スクリーンショットの保存先", parent=self.root)
+        if folder:
+            self.screenshot_dir_var.set(folder)
 
     def _export_snippets_csv(self) -> None:
         path = filedialog.asksaveasfilename(title="定型文CSV出力", defaultextension=".csv", filetypes=[("CSV", "*.csv")])
@@ -1481,6 +1589,193 @@ class ShinClipboardApp:
             self.call_window.withdraw()
         self.root.withdraw()
 
+    # ----- screenshots ------------------------------------------------------------
+
+    def start_capture(self, delay_seconds: float = 0) -> None:
+        """Freeze the screen and let the user pick a region, now or after a countdown.
+
+        Pressing either screenshot hotkey while a countdown runs cancels it; that
+        is the only way to abort one, since the countdown window never takes focus.
+        """
+        if self._countdown_window is not None:
+            self._cancel_countdown()
+            return
+        if self.capturing:
+            return  # a second overlay would fight the first one for the grab
+        self.capturing = True
+        if delay_seconds > 0:
+            self._start_countdown(int(round(delay_seconds)))
+            return
+        self._begin_capture()
+
+    def start_delayed_capture(self) -> None:
+        try:
+            delay = float(self.config["settings"].get("screenshot_delay_seconds", 3))
+        except (TypeError, ValueError):
+            delay = 3
+        self.start_capture(max(1, delay))
+
+    def _begin_capture(self, wait: bool = False) -> None:
+        self._hidden_for_capture = [
+            window
+            for window in [self.root, getattr(self, "call_window", None)]
+            if window is not None and window.winfo_viewable()
+        ]
+        for window in self._hidden_for_capture:
+            window.withdraw()
+        self.root.update_idletasks()
+        # Give the compositor a moment to actually take our windows off screen,
+        # otherwise they end up inside the screenshot. Nothing was hidden when
+        # the request came from a hotkey, so no wait is needed then.
+        self.root.after(120 if (self._hidden_for_capture or wait) else 0, self._run_selector)
+
+    def _start_countdown(self, seconds: int) -> None:
+        window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(background="#111827")
+        self._countdown_var = tk.StringVar()
+        tk.Label(
+            window, textvariable=self._countdown_var, background="#111827", foreground="#f8fafc",
+            font=("Yu Gothic UI", 28, "bold"), padx=24, pady=6,
+        ).pack()
+        tk.Label(
+            window, text="もう一度ショートカットを押すと中止", background="#111827", foreground="#cbd5e1",
+            font=("Yu Gothic UI", 10), padx=12, pady=6,
+        ).pack()
+        window.update_idletasks()
+        x = (self.root.winfo_screenwidth() - window.winfo_reqwidth()) // 2
+        window.geometry(f"+{x}+24")
+        self._countdown_window = window
+        self._countdown_left = seconds
+        self._tick_countdown()
+
+    def _tick_countdown(self) -> None:
+        if self._countdown_window is None:
+            return
+        if self._countdown_left <= 0:
+            window, self._countdown_window = self._countdown_window, None
+            window.destroy()
+            self._begin_capture(wait=True)  # the countdown itself must not be in the shot
+            return
+        self._countdown_var.set(f"{self._countdown_left} 秒後に撮影")
+        self.status_var.set(f"{self._countdown_left} 秒後にスクリーンショットを撮ります")
+        self._countdown_left -= 1
+        self._countdown_job = self.root.after(1000, self._tick_countdown)
+
+    def _cancel_countdown(self) -> None:
+        window, self._countdown_window = self._countdown_window, None
+        if self._countdown_job is not None:
+            try:
+                self.root.after_cancel(self._countdown_job)
+            except tk.TclError:
+                pass
+            self._countdown_job = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self.capturing = False
+        self.status_var.set("ディレイ撮影を中止しました")
+
+    def _run_selector(self) -> None:
+        self._selector = RegionSelector(self.root, self._capture_done)
+        try:
+            self._selector.start()
+        except Exception as error:  # noqa: BLE001 - never leave capture mode stuck
+            self._capture_done(None)
+            self.status_var.set(f"スクリーンショットを撮影できません: {error}")
+
+    def _capture_done(self, image: Image.Image | None) -> None:
+        self._selector = None
+        self.capturing = False
+        hidden, self._hidden_for_capture = self._hidden_for_capture, []
+        if image is None:
+            # Aborted: put things back the way they were.
+            for window in hidden:
+                try:
+                    window.deiconify()
+                except tk.TclError:
+                    pass
+            self.status_var.set("スクリーンショットを中止しました")
+            return
+        # Captured: only the editor should appear. Restoring the settings or the
+        # popup here would raise them on top of it on every single shot.
+        # The plain capture is usable straight away; the editor is optional.
+        self._copy_capture(image)
+        self.open_editor(image, f"スクリーンショット {image.width}×{image.height}")
+
+    def _copy_capture(self, image: Image.Image) -> None:
+        try:
+            self._set_clipboard_image(write_export(self.store.data_dir, image))
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self.status_var.set(f"クリップボードへコピーできません: {error}")
+            return
+        if self.config["settings"].get("screenshot_save_to_history", True):
+            relative, width, height = self.store.save_image(image)
+            self.history.add_image(relative, width, height)
+            if self.config["settings"].get("save_history", True):
+                self.store.save_history(self.history)
+            self._refresh_history()
+        self.status_var.set(f"スクリーンショットをクリップボードへコピーしました（{image.width}×{image.height}）")
+
+    def open_editor(self, image: Image.Image, title: str = "画像編集") -> ImageEditorWindow | None:
+        try:
+            editor = ImageEditorWindow(self, image, title)
+        except (OSError, ValueError, tk.TclError) as error:
+            messagebox.showerror("画像編集", str(error))
+            return None
+        self.editors.add(editor)
+        editor.bring_to_front()
+        return editor
+
+    def edit_clipboard_image(self) -> None:
+        image = read_clipboard_image()
+        if image is None:
+            self.status_var.set("クリップボードに画像がありません")
+            return
+        self.open_editor(image, "クリップボードの画像")
+
+    def _edit_image_item(self, item, parent: tk.Misc | None = None) -> None:
+        if item is None or item.kind != "image":
+            messagebox.showinfo("画像編集", "画像の履歴を選んでください。", parent=parent or self.root)
+            return
+        try:
+            with Image.open(self.store.image_path(item.image_path)) as source:
+                image = source.convert("RGBA")
+        except (OSError, ValueError) as error:
+            messagebox.showerror("画像編集", str(error), parent=parent or self.root)
+            return
+        self.open_editor(image, f"履歴の画像 {item.width}×{item.height}")
+
+    def _edit_selected_history_image(self) -> None:
+        self._edit_image_item(self._selected_history())
+
+    def _edit_call_history_image(self, _event=None) -> str:
+        selected = self.call_history_list.curselection()
+        if selected and selected[0] < len(self.call_history_items):
+            self.hide_call_window()
+            self._edit_image_item(self.call_history_items[selected[0]], self.call_window)
+        return "break"
+
+    def _call_history_menu(self, event) -> str:
+        index = self._clicked_list_row(self.call_history_list, event.y)
+        if index is None:
+            return "break"
+        self.call_history_list.selection_clear()
+        self.call_history_list.selection_set(index)
+        item = self.call_history_items[index]
+        menu = tk.Menu(self.call_window, tearoff=0)
+        menu.add_command(label="貼り付け", command=self._paste_call_history)
+        if item.kind == "image":
+            menu.add_command(label="この画像を編集 (Ctrl+E)", command=self._edit_call_history_image)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
     def toggle_monitor(self) -> None:
         self.monitor_enabled = not self.monitor_enabled
         self.monitor_status_var.set("監視中" if self.monitor_enabled else "監視停止中")
@@ -1495,6 +1790,9 @@ class ShinClipboardApp:
             menu = pystray.Menu(
                 pystray.MenuItem("貼り付け候補を開く", lambda *_: self.events.put(("show", None)), default=True),
                 pystray.MenuItem("設定・編集を開く", lambda *_: self.events.put(("show_settings", None))),
+                pystray.MenuItem("スクリーンショットを撮る", lambda *_: self.events.put(("screenshot", None))),
+                pystray.MenuItem("数秒後にスクリーンショットを撮る", lambda *_: self.events.put(("screenshot_delayed", None))),
+                pystray.MenuItem("クリップボードの画像を編集", lambda *_: self.events.put(("edit_clipboard_image", None))),
                 pystray.MenuItem("FIFO 切替", lambda *_: self.events.put(("toggle_fifo", None))),
                 pystray.MenuItem("LIFO 切替", lambda *_: self.events.put(("toggle_lifo", None))),
                 pystray.MenuItem("クリップボード監視 切替", lambda *_: self.events.put(("toggle_monitor", None))),
@@ -1507,6 +1805,13 @@ class ShinClipboardApp:
 
     def quit(self) -> None:
         self.closing = True
+        if self._countdown_window is not None:
+            self._cancel_countdown()
+        if self._selector is not None:
+            self._selector.cancel()
+        for editor in list(self.editors):
+            editor.close()
+        cleanup_exports(self.store.data_dir, max_age=0)
         if self.config["settings"].get("clear_history_on_exit"):
             self.history.clear()
             self.store.save_history(self.history)
