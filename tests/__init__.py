@@ -1,1 +1,1 @@
-"""Automated tests for NewClipboard."""
+"""Automated tests for ShinClipboard."""

@@ -20,8 +20,8 @@ from .clipboard_images import clipboard_change_token, read_clipboard_image, writ
 from .core import FifoQueue
 from .hotkeys import GlobalHotkeyService
 from .single_instance import SingleInstance
-from .startup import set_startup, startup_enabled
-from .storage import JsonStore, default_data_dir
+from .startup import migrate_legacy_startup, set_startup, startup_enabled
+from .storage import JsonStore, default_data_dir, migrate_legacy_data_dir
 from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from .transforms import apply_enabled, apply_transform
 from .widgets import ImageListbox
@@ -62,7 +62,7 @@ def shortcut_modifier_mask() -> int:
     return 0x4 | 0x8  # Control, Alt (Mod1)
 
 
-class NewClipboardApp:
+class ShinClipboardApp:
     POLL_MS = 350
 
     def __init__(self, root: tk.Tk, store: JsonStore):
@@ -120,11 +120,11 @@ class NewClipboardApp:
             self.root.withdraw()
 
     def _configure_window(self) -> None:
-        self.root.title("NewClipboard - 設定・編集")
+        self.root.title("ShinClipboard - 設定・編集")
         self.root.geometry("920x720")
         self.root.minsize(720, 500)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
-        icon_png = resource_path("assets/newclipboard-512.png")
+        icon_png = resource_path("assets/shinclipboard-512.png")
         if icon_png.exists():
             self.window_icon = tk.PhotoImage(file=icon_png)
             self.root.iconphoto(True, self.window_icon)
@@ -137,7 +137,7 @@ class NewClipboardApp:
     def _build_ui(self) -> None:
         header = ttk.Frame(self.root, padding=(16, 14, 16, 6))
         header.pack(fill="x")
-        ttk.Label(header, text="NewClipboard", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="ShinClipboard", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="クリップボード履歴と定型文", style="Muted.TLabel").pack(side="left", padx=14)
         ttk.Button(header, text="隠す", command=self.hide_window).pack(side="right")
 
@@ -162,7 +162,7 @@ class NewClipboardApp:
 
     def _build_call_window(self) -> None:
         self.call_window = tk.Toplevel(self.root)
-        self.call_window.title("NewClipboard - 貼り付け")
+        self.call_window.title("ShinClipboard - 貼り付け")
         self.call_window.geometry("520x340")
         self.call_window.minsize(340, 200)
         self.call_window.protocol("WM_DELETE_WINDOW", self.hide_call_window)
@@ -1491,7 +1491,7 @@ class NewClipboardApp:
             import pystray
             from PIL import Image
 
-            image = Image.open(resource_path("assets/newclipboard.png"))
+            image = Image.open(resource_path("assets/shinclipboard.png"))
             menu = pystray.Menu(
                 pystray.MenuItem("貼り付け候補を開く", lambda *_: self.events.put(("show", None)), default=True),
                 pystray.MenuItem("設定・編集を開く", lambda *_: self.events.put(("show_settings", None))),
@@ -1500,7 +1500,7 @@ class NewClipboardApp:
                 pystray.MenuItem("クリップボード監視 切替", lambda *_: self.events.put(("toggle_monitor", None))),
                 pystray.MenuItem("終了", lambda *_: self.events.put(("quit", None))),
             )
-            self.tray = pystray.Icon("NewClipboard", image, "NewClipboard", menu)
+            self.tray = pystray.Icon("ShinClipboard", image, "ShinClipboard", menu)
             self.tray.run_detached()
         except Exception as error:
             self.status_var.set(f"タスクトレイを開始できません: {error}")
@@ -1520,13 +1520,15 @@ class NewClipboardApp:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="NewClipboard")
+    parser = argparse.ArgumentParser(description="ShinClipboard")
     parser.add_argument("--data-dir", type=Path, default=default_data_dir(), help="履歴などの保存先")
     parser.add_argument("--config", type=Path, help="共有する設定JSONのパス")
     return parser
 
 
 def run(argv: list[str] | None = None) -> None:
+    migrate_legacy_data_dir()
+    migrate_legacy_startup()
     args = build_parser().parse_args(argv)
     instance = SingleInstance(args.data_dir)
     if not instance.acquire():
@@ -1534,7 +1536,7 @@ def run(argv: list[str] | None = None) -> None:
         return
     try:
         root = tk.Tk()
-        app = NewClipboardApp(root, JsonStore(args.data_dir, args.config))
+        app = ShinClipboardApp(root, JsonStore(args.data_dir, args.config))
         instance.start_listener(lambda: app.events.put(("show", None)))
         root.mainloop()
     finally:

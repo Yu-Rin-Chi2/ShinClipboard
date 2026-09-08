@@ -5,7 +5,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
-from shutil import copy2
+from shutil import copy2, copytree
 from tempfile import NamedTemporaryFile
 from typing import Any
 from uuid import uuid4
@@ -180,5 +180,33 @@ class JsonStore:
 def default_data_dir() -> Path:
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home()))
+        return base / "ShinClipboard"
+    return Path.home() / ".shinclipboard"
+
+
+def legacy_data_dir() -> Path:
+    """Where the app stored its data before it was renamed to ShinClipboard."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home()))
         return base / "NewClipboard"
     return Path.home() / ".newclipboard"
+
+
+def migrate_legacy_data_dir(target: Path | None = None) -> Path | None:
+    """Copy pre-rename data into the new directory and return it when copied.
+
+    The old directory is left untouched so the previous build keeps working if
+    the user rolls back. Clipboard history and snippets only live here, so a
+    copy is preferred over a move even though it leaves data behind.
+    """
+    destination = Path(target).expanduser() if target else default_data_dir()
+    source = legacy_data_dir()
+    if destination.exists() or source == destination:
+        return None
+    if not (source / "config.json").exists():
+        return None
+    try:
+        copytree(source, destination)
+    except OSError:
+        return None
+    return destination

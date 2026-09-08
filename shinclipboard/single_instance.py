@@ -22,7 +22,7 @@ class SingleInstance:
         resolved = str(Path(data_dir).expanduser().resolve())
         identity = resolved.casefold() if os.name == "nt" else resolved
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        self.mutex_name = f"Local\\NewClipboard-{digest[:24]}"
+        self.mutex_name = f"Local\\ShinClipboard-{digest[:24]}"
         self.port = PORT_BASE + int(digest[:8], 16) % PORT_RANGE
         self._kernel32 = None
         self._mutex_handle = None
@@ -50,7 +50,7 @@ class SingleInstance:
 
         import fcntl
 
-        lock_path = Path.home() / f".newclipboard-{self.mutex_name.rsplit('-', 1)[-1]}.lock"
+        lock_path = Path.home() / f".shinclipboard-{self.mutex_name.rsplit('-', 1)[-1]}.lock"
         stream = lock_path.open("a+b")
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -87,7 +87,7 @@ class SingleInstance:
                 if request.strip() == b"show":
                     on_show()
 
-        self._listener = threading.Thread(target=listen, name="NewClipboardInstanceListener", daemon=True)
+        self._listener = threading.Thread(target=listen, name="ShinClipboardInstanceListener", daemon=True)
         self._listener.start()
 
     def notify_existing(self, timeout: float = 1.0) -> bool:

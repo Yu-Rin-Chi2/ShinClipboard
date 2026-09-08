@@ -1,16 +1,18 @@
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from PIL import Image
 
-from newclipboard.core import ClipboardHistory, FifoQueue
-from newclipboard.hotkeys import DoubleTapDetector, portable_to_pynput
-from newclipboard.single_instance import SingleInstance
-from newclipboard.storage import JsonStore
-from newclipboard.transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
-from newclipboard.transforms import apply_transform
+from shinclipboard.core import ClipboardHistory, FifoQueue
+from shinclipboard.hotkeys import DoubleTapDetector, portable_to_pynput
+from shinclipboard.single_instance import SingleInstance
+from shinclipboard import storage
+from shinclipboard.storage import JsonStore, migrate_legacy_data_dir
+from shinclipboard.transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
+from shinclipboard.transforms import apply_transform
 
 
 class HistoryTests(unittest.TestCase):
@@ -49,6 +51,56 @@ class FifoTests(unittest.TestCase):
         self.assertEqual(queue.pop("lifo"), "b")
         self.assertEqual(queue.remove(1), "x")
         self.assertEqual(queue.joined(), "A")
+
+
+class LegacyMigrationTests(unittest.TestCase):
+    """The rename from NewClipboard must not strand existing user data."""
+
+    def _legacy_dir(self, base: Path) -> Path:
+        legacy = base / "NewClipboard"
+        store = JsonStore(legacy)
+        config = store.load_config()
+        config["groups"][0]["name"] = "移行前グループ"
+        store.save_config(config)
+        history = ClipboardHistory(limit=10)
+        history.add("移行前の履歴")
+        store.save_history(history)
+        return legacy
+
+    def test_legacy_data_is_copied_and_original_is_kept(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            legacy = self._legacy_dir(base)
+            target = base / "ShinClipboard"
+            with unittest.mock.patch.object(storage, "legacy_data_dir", return_value=legacy):
+                self.assertEqual(migrate_legacy_data_dir(target), target)
+
+            migrated = JsonStore(target)
+            self.assertEqual(migrated.load_config()["groups"][0]["name"], "移行前グループ")
+            self.assertEqual([item.text for item in migrated.load_history(10).search()], ["移行前の履歴"])
+            self.assertTrue((legacy / "config.json").exists())
+
+    def test_existing_data_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            legacy = self._legacy_dir(base)
+            target = base / "ShinClipboard"
+            current = JsonStore(target)
+            config = current.load_config()
+            config["groups"][0]["name"] = "移行後グループ"
+            current.save_config(config)
+
+            with unittest.mock.patch.object(storage, "legacy_data_dir", return_value=legacy):
+                self.assertIsNone(migrate_legacy_data_dir(target))
+            self.assertEqual(JsonStore(target).load_config()["groups"][0]["name"], "移行後グループ")
+
+    def test_missing_legacy_directory_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            target = base / "ShinClipboard"
+            with unittest.mock.patch.object(storage, "legacy_data_dir", return_value=base / "absent"):
+                self.assertIsNone(migrate_legacy_data_dir(target))
+            self.assertFalse(target.exists())
 
 
 class StorageTests(unittest.TestCase):
@@ -157,9 +209,9 @@ class CallWindowTests(unittest.TestCase):
     def test_keyboard_switches_tabs_and_snippet_groups(self):
         import tkinter as tk
 
-        from newclipboard.app import NewClipboardApp
+        from shinclipboard.app import ShinClipboardApp
 
-        class HeadlessApp(NewClipboardApp):
+        class HeadlessApp(ShinClipboardApp):
             def _start_tray(self) -> None:
                 pass
 
@@ -206,11 +258,11 @@ class CallWindowTests(unittest.TestCase):
     def test_only_quick_keys_paste_from_the_popup(self):
         import tkinter as tk
 
-        from newclipboard.app import NewClipboardApp
+        from shinclipboard.app import ShinClipboardApp
 
         pasted: list[str] = []
 
-        class HeadlessApp(NewClipboardApp):
+        class HeadlessApp(ShinClipboardApp):
             def _start_tray(self) -> None:
                 pass
 
@@ -256,9 +308,9 @@ class CallWindowTests(unittest.TestCase):
     def test_history_popup_shows_image_thumbnails(self):
         import tkinter as tk
 
-        from newclipboard.app import NewClipboardApp
+        from shinclipboard.app import ShinClipboardApp
 
-        class HeadlessApp(NewClipboardApp):
+        class HeadlessApp(ShinClipboardApp):
             def _start_tray(self) -> None:
                 pass
 
@@ -307,7 +359,7 @@ class CallWindowTests(unittest.TestCase):
     def test_history_rows_can_be_dragged_to_other_apps(self):
         import tkinter as tk
 
-        from newclipboard.app import NewClipboardApp
+        from shinclipboard.app import ShinClipboardApp
 
         try:
             import tkinterdnd2  # noqa: F401
@@ -317,7 +369,7 @@ class CallWindowTests(unittest.TestCase):
         pasted: list[bool] = []
         hidden: list[bool] = []
 
-        class HeadlessApp(NewClipboardApp):
+        class HeadlessApp(ShinClipboardApp):
             def _start_tray(self) -> None:
                 pass
 

@@ -1,4 +1,4 @@
-# NewClipboard
+# ShinClipboard（シン・クリップボード）
 
 Windows / macOS 向けの、クリップボード履歴・定型文・連続貼り付け管理アプリです。
 
@@ -77,27 +77,40 @@ macOSでは初回に「システム設定 > プライバシーとセキュリテ
 クラウド同期フォルダの同一ファイルを直接使う場合は、次のように起動できます。
 
 ```powershell
-python main.py --config "D:\Sync\NewClipboard\config.json"
+python main.py --config "D:\Sync\ShinClipboard\config.json"
 ```
 
 ```bash
-python3 main.py --config "$HOME/Sync/NewClipboard/config.json"
+python3 main.py --config "$HOME/Sync/ShinClipboard/config.json"
 ```
 
 ## テストとWindows実行ファイル
 
 ```powershell
 python -m unittest discover -v
-python -m PyInstaller --clean NewClipboard.spec
+python -m PyInstaller --clean ShinClipboard.spec
 ```
 
-生成物は `dist/NewClipboard.exe` です。macOS版はmacOS上で同じspecを使ってビルドしてください。
+生成物は `dist/ShinClipboard.exe` です。macOS版はmacOS上で同じspecを使ってビルドしてください。
 
-アプリアイコンのソースは `assets/newclipboard.png`、Windows用は `assets/newclipboard.ico` です。
+アプリアイコンのソースは `assets/shinclipboard.png`、Windows用は `assets/shinclipboard.ico` です。
 
 ## 保存先
 
-- Windows: `%APPDATA%\NewClipboard\config.json`、`history.json`、`images/`
-- macOS: `~/.newclipboard/config.json`、`history.json`、`images/`
+- Windows: `%APPDATA%\ShinClipboard\config.json`、`history.json`、`images/`
+- macOS: `~/.shinclipboard/config.json`、`history.json`、`images/`
 
 設定JSONはスキーマバージョン付きです。読み込み時は現設定を `config.json.bak` に退避してから置換します。
+
+## NewClipboardからの移行
+
+0.3.0でアプリ名を NewClipboard から ShinClipboard へ変更しました。旧名称で使っていた場合、初回起動時に次を自動で引き継ぎます。
+
+- 保存データ（`%APPDATA%\NewClipboard` / `~/.newclipboard`）を新しい保存先へ**コピー**します。旧フォルダはそのまま残すので、動作を確認してから手動で削除してください
+- OSの自動起動登録を新しい実行ファイルへ付け替え、旧登録を削除します
+
+旧バージョンで作成したZIPバックアップとCSVは、そのまま読み込めます。
+
+## ライセンス
+
+MIT License. 詳細は [LICENSE](LICENSE) を参照してください。

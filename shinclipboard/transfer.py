@@ -80,7 +80,7 @@ def restore_backup(source: Path, config_path: Path, history_path: Path) -> None:
         allowed = {"config.json", "history.json"}
         allowed.update(name for name in names if name.startswith("images/") and Path(name).name == name.removeprefix("images/") and name.endswith(".png"))
         if "config.json" not in names or names - allowed:
-            raise ValueError("NewClipboardのバックアップ形式ではありません。")
+            raise ValueError("ShinClipboardのバックアップ形式ではありません。")
         config = json.loads(archive.read("config.json").decode("utf-8-sig"))
         if not isinstance(config, dict) or "schema_version" not in config:
             raise ValueError("設定データが壊れています。")

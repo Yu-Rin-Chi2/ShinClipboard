@@ -2,7 +2,7 @@
 
 import sys
 
-app_icon = "assets/newclipboard.ico" if sys.platform == "win32" else "assets/newclipboard.png"
+app_icon = "assets/shinclipboard.ico" if sys.platform == "win32" else "assets/shinclipboard.png"
 
 a = Analysis(
     ["main.py"],
@@ -24,7 +24,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="NewClipboard",
+    name="ShinClipboard",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
