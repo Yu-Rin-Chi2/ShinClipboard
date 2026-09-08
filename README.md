@@ -32,7 +32,15 @@ Windows / macOS 向けの、クリップボード履歴・定型文・連続貼�
 
 `primary` はWindowsではCtrl、macOSではCommandへ自動変換されます。
 
-## 起動
+## ダウンロード
+
+Windows版は[リリースページ](https://github.com/Yu-Rin-Chi2/ShinClipboard/releases/latest)から `ShinClipboard.exe` をダウンロードしてください。Pythonのインストールもインストーラーも管理者権限も不要で、任意の場所に置いてダブルクリックするだけで動きます。
+
+初回起動時にWindows SmartScreenの警告が出ます。回避手順は「[配布版の実行について](#配布版の実行について)」を参照してください。
+
+macOS版の配布ビルドはありません。下記の手順でソースから起動してください。
+
+## ソースから起動
 
 Python 3.10以降を利用します。
 
