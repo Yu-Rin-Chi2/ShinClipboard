@@ -21,6 +21,7 @@ from .annotations import (
     render_raster,
 )
 from .icons import tool_icon
+from .platform_support import UI_FONT_FAMILY
 
 
 # Tool id -> (button label, tooltip-ish hint shown in the status bar).
@@ -46,6 +47,7 @@ MAX_ZOOM = 8.0
 EXPORT_DIR = "exports"
 EXPORT_MAX_AGE = 24 * 60 * 60
 TOOL_SELECTED_BG = "#bfdbfe"
+SWATCH_SIZE = 20  # pixels per colour swatch, selection ring not included
 TEXTBOX_HINT = "Ctrl+Enter: 確定   Esc: 取りやめ   Enter: 改行"
 
 
@@ -75,7 +77,7 @@ class _Tooltip:
         tip.attributes("-topmost", True)
         tk.Label(
             tip, text=self.text, background="#fefce8", foreground="#1f2937",
-            relief="solid", borderwidth=1, padx=6, pady=3, font=("Yu Gothic UI", 9),
+            relief="solid", borderwidth=1, padx=6, pady=3, font=(UI_FONT_FAMILY, 9),
         ).pack()
         x = self.widget.winfo_rootx()
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
@@ -191,28 +193,37 @@ class ImageEditorWindow:
         self.swatches = ttk.Frame(options)
         self.swatches.pack(side="left")
         for color in PALETTE:
-            swatch = tk.Button(
+            # A frame rather than a button: buttons are sized in characters and
+            # macOS wraps them in a bezel big enough that eight of them take up
+            # a third of the toolbar. A frame is sized in the pixels asked for.
+            swatch = tk.Frame(
                 self.swatches,
                 background=color,
-                activebackground=color,
-                width=2,
-                relief="flat",
-                borderwidth=2,
+                width=SWATCH_SIZE,
+                height=SWATCH_SIZE,
                 highlightthickness=2,
-                command=lambda value=color: self._pick_color(value),
+                highlightbackground=color,
+                cursor="hand2",
             )
             swatch.pack(side="left", padx=1)
+            swatch.bind("<Button-1>", lambda _event, value=color: self._pick_color(value))
         ttk.Button(options, text="…", width=3, command=self._choose_color).pack(side="left", padx=(4, 12))
         ttk.Label(options, text="太さ").pack(side="left")
         ttk.Spinbox(options, from_=1, to=40, width=4, textvariable=self.width_var).pack(side="left", padx=(4, 12))
         ttk.Label(options, text="文字サイズ").pack(side="left")
         ttk.Spinbox(options, from_=8, to=200, width=4, textvariable=self.font_size_var).pack(side="left", padx=(4, 12))
         ttk.Checkbutton(options, text="塗りつぶし", variable=self.filled_var).pack(side="left")
-        ttk.Button(options, text="取り消し", command=self.undo).pack(side="right")
-        ttk.Button(options, text="やり直し", command=self.redo).pack(side="right", padx=6)
-        ttk.Button(options, text="切り抜き解除", command=self.reset_crop).pack(side="right", padx=(0, 12))
-        zoom = ttk.Frame(options)
-        zoom.pack(side="right", padx=(0, 12))
+
+        # What is drawn goes above, what is done to the picture goes here. One
+        # row held both until macOS, where the same widgets are wide enough that
+        # the buttons at the end fall off the window without any sign of it.
+        view = ttk.Frame(self.window, padding=(10, 0, 10, 6))
+        view.pack(fill="x")
+        ttk.Button(view, text="取り消し", command=self.undo).pack(side="right")
+        ttk.Button(view, text="やり直し", command=self.redo).pack(side="right", padx=6)
+        ttk.Button(view, text="切り抜き解除", command=self.reset_crop).pack(side="right", padx=(0, 12))
+        zoom = ttk.Frame(view)
+        zoom.pack(side="left")
         ttk.Label(zoom, text="表示").pack(side="left", padx=(0, 4))
         ttk.Button(zoom, text="－", width=3, command=lambda: self.zoom_by(1 / 1.25)).pack(side="left")
         ttk.Button(zoom, text="＋", width=3, command=lambda: self.zoom_by(1.25)).pack(side="left", padx=2)
@@ -408,7 +419,7 @@ class ImageEditorWindow:
         makes canvas text noticeably larger than the exported text; a negative
         size means pixels and matches `annotations.resolve_font`.
         """
-        return ("Yu Gothic UI", -max(1, int(round(size * self.zoom))))
+        return (UI_FONT_FAMILY, -max(1, int(round(size * self.zoom))))
 
     def _paint_selection(self) -> None:
         self.canvas.delete("handle")

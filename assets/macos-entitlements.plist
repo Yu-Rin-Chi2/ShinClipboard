@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Intel macOS libffi uses executable mappings without MAP_JIT.
+         allow-jit alone leaves PyObjC initialization stuck in ffi_closure_alloc. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

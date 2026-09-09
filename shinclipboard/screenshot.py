@@ -9,6 +9,8 @@ from typing import Iterator
 
 from PIL import Image, ImageGrab
 
+from .platform_support import IS_MAC
+
 
 Rect = tuple[int, int, int, int]
 
@@ -116,6 +118,8 @@ def dpi_aware_windows() -> Iterator[bool]:
 
 def virtual_bounds() -> Rect:
     """The rectangle covering every monitor, in the calling thread's DPI context."""
+    if IS_MAC:
+        return _mac().virtual_bounds()
     user32 = _user32()
     if user32 is None:
         return (0, 0, 0, 0)
@@ -126,6 +130,12 @@ def virtual_bounds() -> Rect:
 
 def grab_screen() -> Image.Image:
     """Every monitor as one picture. Pillow already grabs at full resolution."""
+    if IS_MAC:
+        # Pillow's macOS grab only ever returns the main display, so Quartz is
+        # tried first and its own fallbacks cover the rest.
+        image = _mac().grab_screen()
+        if image is not None:
+            return image
     try:
         return ImageGrab.grab(all_screens=True).convert("RGB")
     except TypeError:  # all_screens is Windows only
@@ -143,6 +153,8 @@ def capture_virtual_screen() -> ScreenCapture:
 
 def monitor_rects() -> list[Rect]:
     """One rectangle per monitor, in the calling thread's DPI context."""
+    if IS_MAC:
+        return _mac().monitor_rects()
     user32 = _user32()
     if user32 is None:
         return []
@@ -165,6 +177,8 @@ def monitor_rects() -> list[Rect]:
 
 def window_rects() -> list[Rect]:
     """Visible top-level window rectangles, front-most first."""
+    if IS_MAC:
+        return _mac().window_rects()
     user32 = _user32()
     if user32 is None:
         return []
@@ -192,6 +206,13 @@ def window_rects() -> list[Rect]:
 
 
 # ----- internals ------------------------------------------------------------------
+
+
+def _mac():
+    """The Quartz backend. Imported here so Windows never loads pyobjc."""
+    from . import screenshot_mac
+
+    return screenshot_mac
 
 
 def _user32():

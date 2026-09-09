@@ -1,6 +1,64 @@
 from __future__ import annotations
 
 import tkinter as tk
+from tkinter import ttk
+
+
+class ScrollableFrame(ttk.Frame):
+    """A container whose contents scroll when they outgrow the space given.
+
+    Tk has no such widget: a plain frame simply clips what does not fit and
+    leaves no way to reach it. Children go into `body`, which is held as wide as
+    the visible area so anything packed with `fill="x"` still stretches.
+    """
+
+    WHEEL_STEP = 3  # list rows per wheel notch, matching the other lists
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master)
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, takefocus=0)
+        background = ttk.Style().lookup("TFrame", "background")
+        if background:
+            self._canvas.configure(background=background)
+        self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._scrollbar.pack(side="right", fill="y")
+        self.body = ttk.Frame(self._canvas, **kwargs)
+        self._body_id = self._canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>", self._on_body_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        # A wheel event goes to the widget under the pointer, which is one of the
+        # rows rather than the canvas, so the binding has to be global. It is
+        # attached only while the pointer is inside, which keeps it from
+        # swallowing the scrolling of every other window in the app.
+        self._canvas.bind("<Enter>", lambda _: self._bind_wheel())
+        self._canvas.bind("<Leave>", lambda _: self._unbind_wheel())
+
+    def _on_body_configure(self, _event=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event) -> None:
+        self._canvas.itemconfigure(self._body_id, width=event.width)
+
+    def _bind_wheel(self) -> None:
+        self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self._canvas.bind_all("<Button-4>", lambda _: self._scroll_by(-self.WHEEL_STEP))
+        self._canvas.bind_all("<Button-5>", lambda _: self._scroll_by(self.WHEEL_STEP))
+
+    def _unbind_wheel(self) -> None:
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._canvas.unbind_all(sequence)
+
+    def _on_wheel(self, event) -> None:
+        # Windows reports the wheel in multiples of 120; macOS in small counts.
+        delta = event.delta
+        steps = -int(delta / 120) if abs(delta) >= 120 else -delta
+        self._scroll_by(steps * self.WHEEL_STEP)
+
+    def _scroll_by(self, units: int) -> None:
+        if units:
+            self._canvas.yview_scroll(units, "units")
 
 
 class ImageListbox(tk.Text):

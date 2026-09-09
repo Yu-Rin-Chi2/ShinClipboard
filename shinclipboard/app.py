@@ -21,12 +21,31 @@ from .clipboard_images import clipboard_change_token, read_clipboard_image, writ
 from .core import FifoQueue
 from .editor import ImageEditorWindow, cleanup_exports, write_export
 from .hotkeys import GlobalHotkeyService
+from .macos import (
+    ACCESSIBILITY_HINT,
+    ACCESSIBILITY_PANE,
+    SCREEN_RECORDING_HINT,
+    SCREEN_RECORDING_PANE,
+    accessibility_trusted,
+    activate_app,
+    activate_running_app,
+    frontmost_app,
+    hide_app,
+    send_window_to_back,
+    menu_bar_height,
+    open_settings_pane,
+    request_accessibility,
+    request_screen_recording,
+    screen_recording_allowed,
+    send_paste_keystroke,
+)
+from .platform_support import IS_MAC, UI_FONT_FAMILY
 from .single_instance import SingleInstance
 from .startup import migrate_legacy_startup, set_startup, startup_enabled
 from .storage import JsonStore, default_data_dir, migrate_legacy_data_dir
 from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from .transforms import apply_enabled, apply_transform
-from .widgets import ImageListbox
+from .widgets import ImageListbox, ScrollableFrame
 
 
 THEMES = {
@@ -69,6 +88,10 @@ def shortcut_modifier_mask() -> int:
 
 class ShinClipboardApp:
     POLL_MS = 350
+    # How often to look at the macOS permission again. Rare enough that the
+    # lookup never shows in the poll loop, often enough that granting it feels
+    # like it took effect straight away.
+    PERMISSION_CHECK_SECONDS = 2.0
 
     def __init__(self, root: tk.Tk, store: JsonStore):
         self.root = root
@@ -125,6 +148,13 @@ class ShinClipboardApp:
         self.screenshot_format_var = tk.StringVar()
         self.screenshot_copy_var = tk.BooleanVar()
         self.screenshot_history_var = tk.BooleanVar()
+        self.accessibility_status_var = tk.StringVar(value="確認中")
+        self.screen_recording_status_var = tk.StringVar(value="確認中")
+        self._accessibility_warned = False
+        self._accessibility_ok = True
+        self._next_permission_check = 0.0
+        self._status_wrap = 0
+        self._previous_app = None
 
         self._configure_window()
         self._build_ui()
@@ -133,6 +163,7 @@ class ShinClipboardApp:
         self._refresh_all()
         self._restart_hotkeys()
         self._start_tray()
+        self._check_macos_permissions()
         cleanup_exports(self.store.data_dir)
         self.root.after(self.POLL_MS, self._poll)
 
@@ -151,7 +182,7 @@ class ShinClipboardApp:
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
-        style.configure("Title.TLabel", font=("Yu Gothic UI", 15, "bold"))
+        style.configure("Title.TLabel", font=(UI_FONT_FAMILY, 15, "bold"))
         style.configure("Muted.TLabel", foreground="#5f6b7a")
 
     def _build_ui(self) -> None:
@@ -167,18 +198,36 @@ class ShinClipboardApp:
         self.snippet_tab = ttk.Frame(self.tabs, padding=10)
         self.fifo_tab = ttk.Frame(self.tabs, padding=10)
         self.transform_tab = ttk.Frame(self.tabs, padding=10)
-        self.settings_tab = ttk.Frame(self.tabs, padding=10)
+        # The settings tab is far taller than the window and grows with the OS -
+        # macOS lays the same rows out taller and adds the permissions box - so
+        # it is the one tab that has to be reachable by scrolling.
+        settings_scroller = ScrollableFrame(self.tabs, padding=10)
+        self.settings_tab = settings_scroller.body
         self.tabs.add(self.history_tab, text="履歴")
         self.tabs.add(self.snippet_tab, text="定型文")
         self.tabs.add(self.fifo_tab, text="FIFO")
         self.tabs.add(self.transform_tab, text="整形")
-        self.tabs.add(self.settings_tab, text="設定")
+        self.tabs.add(settings_scroller, text="設定")
         self._build_history_tab()
         self._build_snippet_tab()
         self._build_fifo_tab()
         self._build_transform_tab()
         self._build_settings_tab()
-        ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4)).pack(fill="x")
+        # Some of what goes here is a sentence of guidance rather than a word of
+        # state, and a single line drops its end - the half that says what to do.
+        status = ttk.Label(
+            self.root, textvariable=self.status_var, relief="sunken", anchor="w", justify="left", padding=(8, 4)
+        )
+        status.pack(fill="x")
+        status.bind("<Configure>", self._wrap_status)
+
+    def _wrap_status(self, event) -> None:
+        """Follow the window's width, ignoring the resize wrapping itself causes."""
+        width = max(120, event.width - 16)
+        if self._status_wrap == width:
+            return
+        self._status_wrap = width
+        event.widget.configure(wraplength=width)
 
     def _build_call_window(self) -> None:
         self.call_window = tk.Toplevel(self.root)
@@ -201,7 +250,12 @@ class ShinClipboardApp:
         for sequence in ("<Right>", "<Control-Right>"):
             self.call_window.bind(sequence, lambda _: self._move_call_group(1))
 
-        ttk.Label(self.call_window, text=CALL_WINDOW_HINT, style="Muted.TLabel", padding=(8, 2)).pack(side="bottom", fill="x")
+        hint = ttk.Label(self.call_window, text=CALL_WINDOW_HINT, style="Muted.TLabel", padding=(8, 2))
+        hint.pack(side="bottom", fill="x")
+        # The hint lists every key and the window is small and resizable, so it
+        # does not fit on one line at every size or in every desktop's UI font.
+        # Wrapping to the width it actually has beats clipping the last keys off.
+        hint.bind("<Configure>", lambda event, label=hint: self._wrap_label(label, event.width))
         self.call_tabs = ttk.Notebook(self.call_window)
         self.call_tabs.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         history_frame = ttk.Frame(self.call_tabs, padding=2)
@@ -210,7 +264,7 @@ class ShinClipboardApp:
         self.call_tabs.add(snippet_frame, text="定型文")
         self.call_tabs.bind("<<NotebookTabChanged>>", self._focus_call_list)
 
-        self.call_history_list = ImageListbox(history_frame, font=("Yu Gothic UI", 11))
+        self.call_history_list = ImageListbox(history_frame, font=(UI_FONT_FAMILY, 11))
         self.call_history_list.pack(fill="both", expand=True)
         self.call_history_list.bind("<ButtonRelease-1>", self._call_history_click)
         self.call_history_list.bind("<Return>", lambda _: self._paste_call_history())
@@ -237,7 +291,7 @@ class ShinClipboardApp:
             snippet_frame,
             activestyle="none",
             exportselection=False,
-            font=("Yu Gothic UI", 11),
+            font=(UI_FONT_FAMILY, 11),
             selectborderwidth=0,
         )
         self.call_snippet_list.pack(fill="both", expand=True)
@@ -258,7 +312,7 @@ class ShinClipboardApp:
             self.history_tab,
             activestyle="none",
             exportselection=False,
-            font=("Yu Gothic UI", 11),
+            font=(UI_FONT_FAMILY, 11),
             selectborderwidth=0,
             selectmode="extended",
         )
@@ -282,7 +336,7 @@ class ShinClipboardApp:
         outer.add(left, weight=1)
         outer.add(right, weight=3)
         ttk.Label(left, text="グループ").pack(anchor="w")
-        self.group_list = tk.Listbox(left, exportselection=False, font=("Yu Gothic UI", 10))
+        self.group_list = tk.Listbox(left, exportselection=False, font=(UI_FONT_FAMILY, 10))
         self.group_list.pack(fill="both", expand=True, pady=6)
         self.group_list.bind("<<ListboxSelect>>", lambda _: self._refresh_snippets())
         group_bar = ttk.Frame(left)
@@ -322,12 +376,12 @@ class ShinClipboardApp:
     def _build_fifo_tab(self) -> None:
         top = ttk.Frame(self.fifo_tab)
         top.pack(fill="x", pady=(0, 8))
-        ttk.Label(top, textvariable=self.fifo_status_var, font=("Yu Gothic UI", 12, "bold")).pack(side="left")
+        ttk.Label(top, textvariable=self.fifo_status_var, font=(UI_FONT_FAMILY, 12, "bold")).pack(side="left")
         self.fifo_toggle_button = ttk.Button(top, text="FIFO開始", command=self.toggle_fifo)
         self.fifo_toggle_button.pack(side="right")
         ttk.Button(top, text="LIFO開始", command=self.toggle_lifo).pack(side="right", padx=6)
         ttk.Button(top, text="停止", command=self.stop_stock).pack(side="right")
-        self.fifo_list = tk.Listbox(self.fifo_tab, font=("Yu Gothic UI", 11))
+        self.fifo_list = tk.Listbox(self.fifo_tab, font=(UI_FONT_FAMILY, 11))
         self.fifo_list.pack(fill="both", expand=True)
         bar = ttk.Frame(self.fifo_tab)
         bar.pack(fill="x", pady=(8, 0))
@@ -358,6 +412,8 @@ class ShinClipboardApp:
             style="Muted.TLabel",
         ).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(3, 12))
         ttk.Button(form, text="設定を保存", command=self._save_settings).grid(row=len(rows) + 1, column=0, sticky="w")
+        if IS_MAC:
+            self._build_permissions_section()
         transfer = ttk.LabelFrame(self.settings_tab, text="設定ファイルの移管", padding=12)
         transfer.pack(fill="x", pady=20)
         ttk.Label(transfer, text="定型文・グループ・ショートカットを1つのUTF-8 JSONで移管できます。").pack(anchor="w")
@@ -409,9 +465,10 @@ class ShinClipboardApp:
         ttk.Checkbutton(shots, text="コピーした編集結果を履歴へ残す", variable=self.screenshot_history_var).grid(
             row=4, column=1, sticky="w", pady=3
         )
+        builtin = "macOS標準の Cmd+Shift+4" if IS_MAC else "Windows標準の Win+Shift+S"
         ttk.Label(
             shots,
-            text="Windows標準の Win+Shift+S とは別の機能です。ディレイ撮影はメニューやツールチップを開いてから写すときに使います。",
+            text=f"{builtin} とは別の機能です。ディレイ撮影はメニューやツールチップを開いてから写すときに使います。",
             style="Muted.TLabel",
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
@@ -421,6 +478,108 @@ class ShinClipboardApp:
         ttk.Button(portability, text="定型文CSV取込", command=self._import_snippets_csv).pack(side="left", padx=6)
         ttk.Button(portability, text="全バックアップ", command=self._backup_all).pack(side="left", padx=(14, 6))
         ttk.Button(portability, text="復元", command=self._restore_all).pack(side="left")
+
+    @staticmethod
+    def _wrap_label(label: ttk.Label, width: int) -> None:
+        """Rewrap a label to the width it was just given.
+
+        Changing `wraplength` re-lays the label out and so fires `<Configure>`
+        again; only writing it when the value really changed stops the two from
+        chasing each other.
+        """
+        wanted = max(120, width - 16)
+        if label.cget("wraplength") != wanted:
+            label.configure(wraplength=wanted)
+
+    def _build_permissions_section(self) -> None:
+        """Report the two macOS permissions the app cannot work without.
+
+        Both fail silently when missing - the shortcut simply never fires, the
+        screen grab comes back empty - and neither can be granted from in here,
+        so the state is spelled out next to a button that opens the pane that
+        changes it.
+        """
+        box = ttk.LabelFrame(self.settings_tab, text="macOS の許可", padding=12)
+        box.pack(fill="x", pady=(20, 12))
+        rows = (
+            ("アクセシビリティ", "ショートカットと自動貼り付けに使います", self.accessibility_status_var, ACCESSIBILITY_PANE),
+            ("画面収録", "スクリーンショットの撮影に使います", self.screen_recording_status_var, SCREEN_RECORDING_PANE),
+        )
+        for row, (title, hint, variable, pane) in enumerate(rows):
+            ttk.Label(box, text=title).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=4)
+            ttk.Label(box, textvariable=variable).grid(row=row, column=1, sticky="w", padx=(0, 14))
+            ttk.Button(box, text="許可画面を開く", command=lambda url=pane: open_settings_pane(url)).grid(
+                row=row, column=2, sticky="w"
+            )
+            ttk.Label(box, text=hint, style="Muted.TLabel").grid(row=row, column=3, sticky="w", padx=(14, 0))
+        ttk.Button(box, text="状態を再確認", command=self._refresh_permissions).grid(
+            row=len(rows), column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Label(
+            box,
+            text="アクセシビリティは許可するとすぐに反映されます。画面収録は許可のあとアプリを再起動してください。",
+            style="Muted.TLabel",
+        ).grid(row=len(rows), column=1, columnspan=3, sticky="w", pady=(10, 0))
+        # macOS records a grant against the signature the app had at the time.
+        # A rebuild with a different signature leaves the switch showing on
+        # while nothing works, and toggling it does not rewrite the record.
+        ttk.Label(
+            box,
+            text="一覧でONなのに「未許可」のままなら、その登録は古い署名のものです。"
+            "「−」で削除してから「+」で追加し直してください。",
+            style="Muted.TLabel",
+        ).grid(row=len(rows) + 1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+    def _refresh_permissions(self) -> None:
+        if not IS_MAC:
+            return
+        self.accessibility_status_var.set("許可済み" if accessibility_trusted() else "未許可")
+        self.screen_recording_status_var.set("許可済み" if screen_recording_allowed() else "未許可")
+
+    def _check_macos_permissions(self) -> None:
+        """Show the system prompts once at startup and say what is still missing.
+
+        macOS only ever shows each prompt once per app, so a user who dismissed
+        it is left with the settings tab and the status line to find their way
+        back; both are wired up before this runs.
+        """
+        if not IS_MAC:
+            return
+        self._refresh_permissions()
+        self._accessibility_ok = accessibility_trusted()
+        if not self._accessibility_ok:
+            request_accessibility()
+            self.status_var.set(f"ショートカットが使えません。{ACCESSIBILITY_HINT}")
+        elif not screen_recording_allowed():
+            request_screen_recording()
+            self.status_var.set(f"スクリーンショットが撮れません。{SCREEN_RECORDING_HINT}")
+
+    def _watch_accessibility(self) -> None:
+        """Take the shortcuts up again the moment macOS grants the permission.
+
+        Listeners started without it get an event tap that macOS creates and
+        immediately switches off, so no key ever reaches them and every shortcut
+        - the double Ctrl included - stays dead for the life of the process.
+        Granting it cannot be done from in here, but it can be noticed, and
+        starting the listeners again is what gets a tap that works. Without this
+        the only way back is quitting and opening the app once more.
+        """
+        if not IS_MAC:
+            return
+        now = time.monotonic()
+        if now < self._next_permission_check:
+            return
+        self._next_permission_check = now + self.PERMISSION_CHECK_SECONDS
+        trusted = accessibility_trusted()
+        if trusted == self._accessibility_ok:
+            return
+        self._accessibility_ok = trusted
+        self._refresh_permissions()
+        if trusted:
+            self._restart_hotkeys()
+            self.status_var.set("アクセシビリティが許可されました。ショートカットを有効にしました。")
+        else:
+            self.status_var.set(f"ショートカットが使えません。{ACCESSIBILITY_HINT}")
 
     def _build_transform_tab(self) -> None:
         ttk.Label(
@@ -453,6 +612,7 @@ class ShinClipboardApp:
     def _poll(self) -> None:
         if self.closing:
             return
+        self._watch_accessibility()
         text = self._read_clipboard()
         token = clipboard_change_token()
         changed = token != self.last_clipboard_token if token is not None else text != self.last_clipboard
@@ -510,6 +670,8 @@ class ShinClipboardApp:
                     self.undo_fifo()
                 elif event == "paste_text":
                     self._paste_text(str(payload))
+                elif event == "paste_failed":
+                    self.status_var.set("自動貼り付けに失敗しました。貼り付け先で手動で貼り付けてください。")
                 elif event == "apply_transform":
                     self._apply_transform_by_id(str(payload))
                 elif event == "screenshot":
@@ -926,7 +1088,7 @@ class ShinClipboardApp:
         dialog.geometry("560x360")
         dialog.transient(owner)
         dialog.grab_set()
-        editor = tk.Text(dialog, wrap="word", font=("Yu Gothic UI", int(self.config["settings"].get("font_size", 11))))
+        editor = tk.Text(dialog, wrap="word", font=(UI_FONT_FAMILY, int(self.config["settings"].get("font_size", 11))))
         editor.pack(fill="both", expand=True, padx=12, pady=12)
         editor.insert("1.0", initial)
         result: list[str] = []
@@ -1039,7 +1201,7 @@ class ShinClipboardApp:
         ttk.Label(dialog, text="メモ").pack(anchor="w", padx=14, pady=(8, 3))
         ttk.Entry(dialog, textvariable=memo_var).pack(fill="x", padx=14)
         ttk.Label(dialog, text="内容").pack(anchor="w", padx=14, pady=(10, 3))
-        content = tk.Text(dialog, wrap="word", height=10, font=("Yu Gothic UI", 10))
+        content = tk.Text(dialog, wrap="word", height=10, font=(UI_FONT_FAMILY, 10))
         content.pack(fill="both", expand=True, padx=14)
         if snippet:
             content.insert("1.0", snippet.get("text", ""))
@@ -1126,22 +1288,56 @@ class ShinClipboardApp:
         self._send_paste()
 
     def _send_paste(self) -> None:
-        self.hide_window()
+        if IS_MAC and not accessibility_trusted():
+            self._warn_missing_accessibility()
+            return
+        # Closing the popup hands the keyboard back to the window it covered, and
+        # leaves the rest of this app exactly where the user had it. A paste
+        # started anywhere else has nothing to hand back to, so it falls back to
+        # stepping aside entirely: withdrawing the windows does not move macOS'
+        # idea of the active application, and the keystroke would land on nothing.
+        if not self.hide_call_window():
+            self.hide_window()
+            hide_app()
 
         def send_paste() -> None:
+            # Long enough for the window we just hid to hand focus back.
             time.sleep(0.12)
             try:
+                if IS_MAC:
+                    if not send_paste_keystroke():
+                        self.events.put(("paste_failed", None))
+                    return
                 from pynput.keyboard import Controller, Key
 
                 keyboard = Controller()
-                modifier = Key.cmd if platform.system() == "Darwin" else Key.ctrl
-                with keyboard.pressed(modifier):
+                with keyboard.pressed(Key.ctrl):
                     keyboard.press("v")
                     keyboard.release("v")
             except Exception:
-                pass
+                self.events.put(("paste_failed", None))
 
         threading.Thread(target=send_paste, daemon=True).start()
+
+    def _warn_missing_accessibility(self) -> None:
+        """Explain the paste that did not happen, once per run.
+
+        The text is already on the clipboard by the time this runs, so the popup
+        still closes and Cmd+V works; only the last step is missing.
+        """
+        self.hide_call_window()
+        self._refresh_permissions()
+        self.status_var.set(f"自動貼り付けにはアクセシビリティの許可が必要です。{ACCESSIBILITY_HINT}")
+        if self._accessibility_warned:
+            return
+        self._accessibility_warned = True
+        if messagebox.askyesno(
+            "アクセシビリティの許可",
+            "選んだ内容はクリップボードへ入れました。\n"
+            "貼り付け先へ自動で貼り付けるには、macOSの許可が必要です。\n\n"
+            f"{ACCESSIBILITY_HINT}\n\n許可の画面を開きますか？",
+        ):
+            open_settings_pane(ACCESSIBILITY_PANE)
 
     def toggle_fifo(self) -> None:
         self.stock_mode = "off" if self.stock_mode == "fifo" else "fifo"
@@ -1480,9 +1676,9 @@ class ShinClipboardApp:
         for widget_name in ("history_list", "group_list", "fifo_list", "call_history_list", "call_snippet_list"):
             widget = getattr(self, widget_name, None)
             if widget:
-                widget.configure(font=("Yu Gothic UI", size), background=colors["background"], foreground=colors["foreground"], selectbackground=colors["accent"])
+                widget.configure(font=(UI_FONT_FAMILY, size), background=colors["background"], foreground=colors["foreground"], selectbackground=colors["accent"])
         style = ttk.Style()
-        style.configure("Treeview", font=("Yu Gothic UI", size), rowheight=max(24, size * 2 + 4))
+        style.configure("Treeview", font=(UI_FONT_FAMILY, size), rowheight=max(24, size * 2 + 4))
         self._refresh_history()
 
     def _choose_screenshot_dir(self) -> None:
@@ -1565,15 +1761,26 @@ class ShinClipboardApp:
             messagebox.showerror("読み込みエラー", str(error))
 
     def show_window(self) -> None:
+        """Put the popup over the window the user is working in, and nothing else.
+
+        The application underneath has to stay where it is, so the one thing that
+        comes forward is this window: it is raised first and stays above the rest
+        while it is open, and the application it interrupted is remembered so the
+        keyboard can go straight back there when it closes.
+        """
         self._refresh_call_window()
+        self._previous_app = frontmost_app()
         self.call_window.deiconify()
         self.call_window.lift()
         self.call_window.attributes("-topmost", True)
-        self.call_window.after(80, lambda: self.call_window.attributes("-topmost", False))
+        activate_app()
+        if self._previous_app is not None:
+            send_window_to_back(self.root.title())
         self.call_window.focus_force()
         self._focus_call_list()
 
     def show_settings_window(self) -> None:
+        activate_app()
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -1581,8 +1788,12 @@ class ShinClipboardApp:
         self.root.after(80, lambda: self.root.attributes("-topmost", keep_top))
         self.root.focus_force()
 
-    def hide_call_window(self) -> None:
+    def hide_call_window(self) -> bool:
+        """Close the popup and give the keyboard back. True if it went somewhere."""
+        self.call_window.attributes("-topmost", False)
         self.call_window.withdraw()
+        app, self._previous_app = self._previous_app, None
+        return activate_running_app(app)
 
     def hide_window(self) -> None:
         if hasattr(self, "call_window"):
@@ -1602,6 +1813,14 @@ class ShinClipboardApp:
             return
         if self.capturing:
             return  # a second overlay would fight the first one for the grab
+        if IS_MAC and not screen_recording_allowed():
+            # Without the permission the grab returns the desktop picture only,
+            # which would look like a bug rather than a missing setting.
+            request_screen_recording()
+            self._refresh_permissions()
+            self.status_var.set(f"スクリーンショットが撮れません。{SCREEN_RECORDING_HINT}")
+            self.show_settings_window()
+            return
         self.capturing = True
         if delay_seconds > 0:
             self._start_countdown(int(round(delay_seconds)))
@@ -1637,15 +1856,16 @@ class ShinClipboardApp:
         self._countdown_var = tk.StringVar()
         tk.Label(
             window, textvariable=self._countdown_var, background="#111827", foreground="#f8fafc",
-            font=("Yu Gothic UI", 28, "bold"), padx=24, pady=6,
+            font=(UI_FONT_FAMILY, 28, "bold"), padx=24, pady=6,
         ).pack()
         tk.Label(
             window, text="もう一度ショートカットを押すと中止", background="#111827", foreground="#cbd5e1",
-            font=("Yu Gothic UI", 10), padx=12, pady=6,
+            font=(UI_FONT_FAMILY, 10), padx=12, pady=6,
         ).pack()
         window.update_idletasks()
         x = (self.root.winfo_screenwidth() - window.winfo_reqwidth()) // 2
-        window.geometry(f"+{x}+24")
+        # macOS paints its menu bar over even a topmost window, so start below it.
+        window.geometry(f"+{x}+{menu_bar_height() + 24}")
         self._countdown_window = window
         self._countdown_left = seconds
         self._tick_countdown()

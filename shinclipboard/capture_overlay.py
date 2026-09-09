@@ -5,6 +5,8 @@ from typing import Callable
 
 from PIL import Image, ImageTk
 
+from .macos import menu_bar_height
+from .platform_support import UI_FONT_FAMILY
 from .screenshot import (
     ScreenCapture,
     capture_virtual_screen,
@@ -22,6 +24,7 @@ HINT = "ドラッグ: 範囲   クリック: ウィンドウ   F: このモニ�
 # A full-screen borderless window that will not close would lock the desktop, so
 # the selector always arms a watchdog on top of the explicit cancel keys.
 WATCHDOG_MS = 120_000
+HINT_MARGIN = 28  # how far below the top of the usable area the hint sits
 DIM_FACTOR = 0.4
 _DIM_LUT = [int(value * DIM_FACTOR) for value in range(256)] * 3
 
@@ -79,6 +82,13 @@ class RegionSelector:
         window = self.window
         if window is not None:
             window.deiconify()
+            # Everything above was drawn while the window was still withdrawn.
+            # macOS Tk keeps no drawing for a window in that state and does not
+            # catch up when it is mapped, so the overlay would come up as an
+            # empty grey sheet over the whole desktop. Flushing the idle work
+            # paints it without re-entering the event loop, which the clipboard
+            # poll running underneath depends on.
+            window.update_idletasks()
             window.after(10, self._take_focus)
 
     # ----- construction -----------------------------------------------------------
@@ -106,9 +116,9 @@ class RegionSelector:
         self.canvas.create_image(0, 0, anchor="nw", tags="bright", state="hidden")
         self.canvas.create_rectangle(0, 0, 0, 0, outline="#ffffff", width=2, dash=(5, 3), tags="selection", state="hidden")
         self.canvas.create_rectangle(0, 0, 0, 0, outline="#38bdf8", width=3, tags="hover", state="hidden")
-        self.canvas.create_text(0, 0, text="", fill="#ffffff", anchor="nw", font=("Yu Gothic UI", 16, "bold"), tags="size")
+        self.canvas.create_text(0, 0, text="", fill="#ffffff", anchor="nw", font=(UI_FONT_FAMILY, 16, "bold"), tags="size")
         self.canvas.create_text(
-            (right - left) // 2, 28, text=HINT, fill="#ffffff", font=("Yu Gothic UI", 16), tags="hint"
+            (right - left) // 2, self._hint_y(), text=HINT, fill="#ffffff", font=(UI_FONT_FAMILY, 16), tags="hint"
         )
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -119,6 +129,18 @@ class RegionSelector:
             window.bind(sequence, lambda _: self.cancel())
         window.bind("<KeyPress>", self._on_key)
         self._watchdog = window.after(WATCHDOG_MS, self.cancel)
+
+    def _hint_y(self) -> int:
+        """Where the hint clears whatever the desktop draws on top of the overlay.
+
+        On macOS that is the menu bar, which only exists along the top of the
+        main display; the main display's top edge is y=0 in screen coordinates,
+        so the overlay's own origin converts it into canvas coordinates.
+        """
+        inset = menu_bar_height()
+        if not inset:
+            return HINT_MARGIN
+        return -self._origin[1] + inset + HINT_MARGIN
 
     def _backdrop(self) -> Image.Image:
         """The frozen screen at overlay size.

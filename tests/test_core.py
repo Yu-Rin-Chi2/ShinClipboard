@@ -203,6 +203,51 @@ def _destroy_root(root) -> None:
     root.destroy()
 
 
+class SettingsTabTests(unittest.TestCase):
+    def test_the_settings_tab_can_be_scrolled_to_its_last_row(self):
+        """The settings rows are taller than the window and grow with the OS.
+
+        macOS lays the same widgets out taller and adds the permissions box, so
+        without a scroller the last sections - screenshots, CSV and backup -
+        cannot be reached at all.
+        """
+        import tkinter as tk
+
+        from shinclipboard.app import ShinClipboardApp
+
+        class HeadlessApp(ShinClipboardApp):
+            def _start_tray(self) -> None:
+                pass
+
+            def _restart_hotkeys(self) -> None:
+                pass
+
+            def _check_macos_permissions(self) -> None:
+                pass
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = HeadlessApp(root, JsonStore(Path(folder)))
+                scroller = root.nametowidget(app.tabs.tabs()[-1])
+                self.assertIs(app.settings_tab.master, scroller._canvas)
+                root.update_idletasks()
+
+                wanted = app.settings_tab.winfo_reqheight()
+                self.assertGreater(wanted, 0)
+                region = [int(value) for value in scroller._canvas.cget("scrollregion").split()]
+                self.assertEqual(region[3], wanted, "the scrollregion covers every row")
+
+                scroller._canvas.yview_moveto(1.0)
+                self.assertAlmostEqual(scroller._canvas.yview()[1], 1.0, places=3)
+        finally:
+            _destroy_root(root)
+
+
 class CallWindowTests(unittest.TestCase):
     """GUI tests. They never map or focus a window, so they do not steal keyboard input."""
 
@@ -362,7 +407,7 @@ class CallWindowTests(unittest.TestCase):
         from shinclipboard.app import ShinClipboardApp
 
         try:
-            import tkinterdnd2  # noqa: F401
+            import tkinterdnd2
         except ImportError:
             self.skipTest("tkinterdnd2 is not installed")
 
@@ -388,6 +433,15 @@ class CallWindowTests(unittest.TestCase):
         except tk.TclError as error:
             self.skipTest(f"Tk is unavailable: {error}")
         root.withdraw()
+        try:
+            tkinterdnd2.TkinterDnD._require(root)
+        except (RuntimeError, tk.TclError) as error:
+            # tkinterdnd2 ships one tkdnd build per OS, architecture and Tcl
+            # major version, and not every combination exists: Intel macOS on
+            # Tcl 9 has none. Dropping the feature with a message is exactly
+            # what the app is meant to do there, so there is nothing to assert.
+            root.destroy()
+            self.skipTest(f"tkdnd has no build for this Tcl/architecture: {error}")
         try:
             with tempfile.TemporaryDirectory() as folder:
                 store = JsonStore(Path(folder))
