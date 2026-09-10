@@ -10,6 +10,8 @@ from uuid import uuid4
 
 
 CSV_HEADERS = ["定型文グループ", "定型文", "メモ", "ホットキー"]
+# `images/` holds the clipboard history, `library/` the registered image library.
+PICTURE_FOLDERS = ("images", "library")
 
 
 def export_snippets_csv(config: dict[str, Any], destination: Path) -> None:
@@ -68,17 +70,18 @@ def create_backup(config_path: Path, history_path: Path, destination: Path) -> N
         archive.write(config_path, "config.json")
         if history_path.exists():
             archive.write(history_path, "history.json")
-        image_dir = history_path.parent / "images"
-        if image_dir.exists():
-            for image_path in image_dir.glob("*.png"):
-                archive.write(image_path, f"images/{image_path.name}")
+        for folder in PICTURE_FOLDERS:
+            picture_dir = history_path.parent / folder
+            if picture_dir.exists():
+                for image_path in picture_dir.glob("*.png"):
+                    archive.write(image_path, f"{folder}/{image_path.name}")
 
 
 def restore_backup(source: Path, config_path: Path, history_path: Path) -> None:
     with zipfile.ZipFile(source, "r") as archive:
         names = set(archive.namelist())
         allowed = {"config.json", "history.json"}
-        allowed.update(name for name in names if name.startswith("images/") and Path(name).name == name.removeprefix("images/") and name.endswith(".png"))
+        allowed.update(name for name in names if _is_picture_entry(name))
         if "config.json" not in names or names - allowed:
             raise ValueError("ShinClipboardのバックアップ形式ではありません。")
         config = json.loads(archive.read("config.json").decode("utf-8-sig"))
@@ -87,9 +90,14 @@ def restore_backup(source: Path, config_path: Path, history_path: Path) -> None:
         config_path.write_bytes(archive.read("config.json"))
         if "history.json" in names:
             history_path.write_bytes(archive.read("history.json"))
-        image_names = [name for name in names if name.startswith("images/")]
-        if image_names:
-            image_dir = history_path.parent / "images"
-            image_dir.mkdir(parents=True, exist_ok=True)
-            for name in image_names:
-                (image_dir / Path(name).name).write_bytes(archive.read(name))
+        for name in names:
+            if _is_picture_entry(name):
+                target = history_path.parent / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(name))
+
+
+def _is_picture_entry(name: str) -> bool:
+    """`images/<file>.png` or `library/<file>.png`, one level deep and nothing else."""
+    folder, _, file_name = name.partition("/")
+    return folder in PICTURE_FOLDERS and Path(file_name).name == file_name and file_name.endswith(".png")

@@ -9,8 +9,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+from typing import Callable
 from uuid import uuid4
 
 import pyperclip
@@ -18,7 +20,8 @@ from PIL import Image, ImageTk
 
 from .capture_overlay import RegionSelector
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
-from .core import FifoQueue
+from .colors import normalize_hex_color, parse_hex_color, swatch_image
+from .core import FifoQueue, HistoryItem
 from .editor import ImageEditorWindow, cleanup_exports, write_export
 from .hotkeys import GlobalHotkeyService
 from .macos import (
@@ -42,10 +45,10 @@ from .macos import (
 from .platform_support import IS_MAC, UI_FONT_FAMILY
 from .single_instance import SingleInstance
 from .startup import migrate_legacy_startup, set_startup, startup_enabled
-from .storage import JsonStore, default_data_dir, migrate_legacy_data_dir
+from .storage import JsonStore, default_data_dir, library_image_paths, migrate_legacy_data_dir
 from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
 from .transforms import apply_enabled, apply_transform
-from .widgets import ImageListbox, ScrollableFrame
+from .widgets import GroupPanel, ImageListbox, ScrollableFrame
 
 
 THEMES = {
@@ -62,14 +65,35 @@ def resource_path(relative: str) -> Path:
 
 QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
 CALL_WINDOW_HINT = (
-    "Tab: 履歴⇔定型文   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
+    "Tab: 履歴/定型文/色/画像   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
     "Ctrl+E: 画像を編集   ドラッグ: 他アプリへ   Esc: 閉じる"
 )
 THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
+TREE_THUMBNAIL_SIZE = (96, 52)  # previews in the image tab's table
+TREE_THUMBNAIL_ROW = 60
 
 
 def quick_key(index: int) -> str:
     return QUICK_KEYS[index] if 0 <= index < len(QUICK_KEYS) else ""
+
+
+@dataclass
+class CallPage:
+    """One grouped tab of the popup: definitions, colours or images.
+
+    Each shows the items of one group at a time; `group_id` remembers which,
+    `items` holds what the rows currently stand for, so a row index maps
+    straight back to its dict.
+    """
+
+    groups_key: str  # config key holding the groups
+    items_key: str  # key of the item list inside a group
+    combo: ttk.Combobox
+    var: tk.StringVar
+    listbox: tk.Listbox | ImageListbox
+    render: Callable[[str, dict], None]  # (quick-key prefix, item) -> appends a row
+    group_id: str | None = None
+    items: list[dict] = field(default_factory=list)
 
 
 def shortcut_modifier_mask() -> int:
@@ -119,6 +143,9 @@ class ShinClipboardApp:
         self._countdown_left = 0
         self._hidden_for_capture: list[tk.Misc] = []
         self._thumbnails: dict[str, ImageTk.PhotoImage] = {}
+        self._tree_thumbnails: dict[str, ImageTk.PhotoImage] = {}
+        self._swatches: dict[tuple[int, int, int, int], ImageTk.PhotoImage] = {}
+        self.call_pages: dict[int, CallPage] = {}  # popup tab index -> page (the history tab has none)
 
         self.search_var = tk.StringVar()
         self.snippet_search_var = tk.StringVar()
@@ -196,6 +223,8 @@ class ShinClipboardApp:
         self.tabs.pack(fill="both", expand=True, padx=14, pady=8)
         self.history_tab = ttk.Frame(self.tabs, padding=10)
         self.snippet_tab = ttk.Frame(self.tabs, padding=10)
+        self.color_tab = ttk.Frame(self.tabs, padding=10)
+        self.image_tab = ttk.Frame(self.tabs, padding=10)
         self.fifo_tab = ttk.Frame(self.tabs, padding=10)
         self.transform_tab = ttk.Frame(self.tabs, padding=10)
         # The settings tab is far taller than the window and grows with the OS -
@@ -205,11 +234,15 @@ class ShinClipboardApp:
         self.settings_tab = settings_scroller.body
         self.tabs.add(self.history_tab, text="履歴")
         self.tabs.add(self.snippet_tab, text="定型文")
+        self.tabs.add(self.color_tab, text="色")
+        self.tabs.add(self.image_tab, text="画像")
         self.tabs.add(self.fifo_tab, text="FIFO")
         self.tabs.add(self.transform_tab, text="整形")
         self.tabs.add(settings_scroller, text="設定")
         self._build_history_tab()
         self._build_snippet_tab()
+        self._build_color_tab()
+        self._build_image_tab()
         self._build_fifo_tab()
         self._build_transform_tab()
         self._build_settings_tab()
@@ -259,9 +292,7 @@ class ShinClipboardApp:
         self.call_tabs = ttk.Notebook(self.call_window)
         self.call_tabs.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         history_frame = ttk.Frame(self.call_tabs, padding=2)
-        snippet_frame = ttk.Frame(self.call_tabs, padding=2)
         self.call_tabs.add(history_frame, text="履歴")
-        self.call_tabs.add(snippet_frame, text="定型文")
         self.call_tabs.bind("<<NotebookTabChanged>>", self._focus_call_list)
 
         self.call_history_list = ImageListbox(history_frame, font=(UI_FONT_FAMILY, 11))
@@ -272,32 +303,49 @@ class ShinClipboardApp:
         # Ctrl is in `shortcut_modifier_mask`, so `_quick_select` ignores this and
         # a bare "e" still pastes as before.
         self.call_window.bind("<Control-e>", self._edit_call_history_image)
-        self._setup_drag_source()
 
-        group_bar = ttk.Frame(snippet_frame)
+        snippet_page = self._build_call_page("定型文", "groups", "snippets", self._render_snippet_row, plain=True)
+        self._build_call_page("色", "color_groups", "colors", self._render_color_row)
+        self._build_call_page("画像", "image_groups", "images", self._render_image_row)
+        # The definitions page predates the others and is still referred to by name.
+        self.call_snippet_list = snippet_page.listbox
+        self.call_group_combo = snippet_page.combo
+        self._setup_drag_source()
+        self.call_window.withdraw()
+
+    def _build_call_page(self, title: str, groups_key: str, items_key: str, render, plain: bool = False) -> CallPage:
+        """Add a grouped tab to the popup. `plain` rows are text only; the rest may carry pictures."""
+        frame = ttk.Frame(self.call_tabs, padding=2)
+        self.call_tabs.add(frame, text=title)
+        group_bar = ttk.Frame(frame)
         group_bar.pack(fill="x", pady=(0, 4))
         ttk.Label(group_bar, text="グループ").pack(side="left", padx=(2, 6))
-        self.call_group_var = tk.StringVar()
-        self.call_group_id: str | None = None
-        self.call_group_combo = ttk.Combobox(
-            group_bar,
-            textvariable=self.call_group_var,
-            state="readonly",
-        )
-        self.call_group_combo.pack(side="left", fill="x", expand=True)
-        self.call_group_combo.bind("<<ComboboxSelected>>", self._call_group_changed)
+        var = tk.StringVar()
+        combo = ttk.Combobox(group_bar, textvariable=var, state="readonly")
+        combo.pack(side="left", fill="x", expand=True)
+        if plain:
+            listbox = tk.Listbox(
+                frame, activestyle="none", exportselection=False, font=(UI_FONT_FAMILY, 11), selectborderwidth=0
+            )
+        else:
+            listbox = ImageListbox(frame, font=(UI_FONT_FAMILY, 11))
+        listbox.pack(fill="both", expand=True)
+        page = CallPage(groups_key, items_key, combo, var, listbox, render)
+        self.call_pages[len(self.call_tabs.tabs()) - 1] = page
+        combo.bind("<<ComboboxSelected>>", lambda _: self._call_group_changed(page))
+        listbox.bind("<ButtonRelease-1>", lambda event: self._call_page_click(page, event))
+        listbox.bind("<Return>", lambda _: self._paste_call_page(page))
+        listbox.bind("<Button-3>", lambda event: self._call_page_menu(page, event))
+        return page
 
-        self.call_snippet_list = tk.Listbox(
-            snippet_frame,
-            activestyle="none",
-            exportselection=False,
-            font=(UI_FONT_FAMILY, 11),
-            selectborderwidth=0,
-        )
-        self.call_snippet_list.pack(fill="both", expand=True)
-        self.call_snippet_list.bind("<ButtonRelease-1>", self._call_snippet_click)
-        self.call_snippet_list.bind("<Return>", lambda _: self._paste_call_snippet())
-        self.call_window.withdraw()
+    @property
+    def call_group_id(self) -> str | None:
+        """The definitions group the popup is showing."""
+        return self.call_pages[1].group_id
+
+    @property
+    def call_snippet_items(self) -> list[dict]:
+        return self.call_pages[1].items
 
     def _build_history_tab(self) -> None:
         top = ttk.Frame(self.history_tab)
@@ -327,6 +375,101 @@ class ShinClipboardApp:
         ttk.Button(bar, text="画像を編集", command=self._edit_selected_history_image).pack(side="left", padx=6)
         ttk.Button(bar, text="改行ごとに展開", command=self._split_history_lines).pack(side="left", padx=6)
         ttk.Button(bar, text="選択を連結", command=self._join_history).pack(side="left")
+        ttk.Label(bar, text="右クリックで色・画像を登録できます", style="Muted.TLabel").pack(side="right")
+
+    def _build_color_tab(self) -> None:
+        outer = ttk.Panedwindow(self.color_tab, orient="horizontal")
+        outer.pack(fill="both", expand=True)
+        self.color_groups = GroupPanel(
+            outer,
+            groups=lambda: self.config["color_groups"],
+            items_key="colors",
+            noun="色",
+            on_change=self._library_changed,
+            on_select=self._refresh_colors,
+            font=(UI_FONT_FAMILY, 10),
+        )
+        right = ttk.Frame(outer)
+        outer.add(self.color_groups, weight=1)
+        outer.add(right, weight=3)
+        ttk.Label(right, text="値は #RRGGBB / #RRGGBBAA で登録し、登録した表記のまま貼り付けます。", style="Muted.TLabel").pack(anchor="w")
+        self.color_tree = ttk.Treeview(right, columns=("title", "value", "memo", "hotkey"), show="tree headings")
+        self.color_tree.column("#0", width=48, stretch=False)
+        # Column widths are what the table asks the window for, so they are kept
+        # small enough that the buttons under it stay inside a 920px window.
+        for key, label, width in (("title", "名前", 130), ("value", "値", 100), ("memo", "メモ", 140), ("hotkey", "ショートカット", 130)):
+            self.color_tree.heading(key, text=label)
+            self.color_tree.column(key, width=width)
+        self.color_tree.pack(fill="both", expand=True, pady=6)
+        self.color_tree.bind(
+            "<Button-3>",
+            lambda event: self._library_menu(
+                self.color_tree, event, self._paste_selected_color, self._copy_selected_color, self._edit_color, self._delete_color
+            ),
+        )
+        self.color_tree.bind("<Return>", lambda _: self._paste_selected_color())
+        self.color_tree.bind("<Delete>", lambda _: self._delete_color())
+        bar = ttk.Frame(right)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="追加", command=self._add_color).pack(side="left")
+        ttk.Button(bar, text="編集", command=self._edit_color).pack(side="left", padx=4)
+        ttk.Button(bar, text="削除", command=self._delete_color).pack(side="left")
+        ttk.Button(bar, text="↑", width=3, command=lambda: self._move_color(-1)).pack(side="left", padx=(8, 2))
+        ttk.Button(bar, text="↓", width=3, command=lambda: self._move_color(1)).pack(side="left")
+        ttk.Button(bar, text="貼り付け", command=self._paste_selected_color).pack(side="right")
+        ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_color).pack(side="right", padx=6)
+
+    def _build_image_tab(self) -> None:
+        outer = ttk.Panedwindow(self.image_tab, orient="horizontal")
+        outer.pack(fill="both", expand=True)
+        self.image_groups = GroupPanel(
+            outer,
+            groups=lambda: self.config["image_groups"],
+            items_key="images",
+            noun="画像",
+            on_change=self._library_changed,
+            on_select=self._refresh_images,
+            font=(UI_FONT_FAMILY, 10),
+        )
+        right = ttk.Frame(outer)
+        outer.add(self.image_groups, weight=1)
+        outer.add(right, weight=3)
+        ttk.Label(
+            right,
+            text="ファイル、クリップボード、履歴（右クリック）から登録できます。画像ファイルをこの表へドロップしても登録できます。",
+            style="Muted.TLabel",
+        ).pack(anchor="w")
+        # Thumbnails need taller rows than the other tables; the style inherits
+        # the font from "Treeview" and only overrides the height.
+        ttk.Style().configure("Library.Treeview", rowheight=TREE_THUMBNAIL_ROW)
+        # `height` is the number of rows the table asks for. With 60px rows the
+        # default of 10 is taller than the tab, and pack answers by pushing the
+        # button bar below it out of the window.
+        self.image_tree = ttk.Treeview(
+            right, columns=("title", "size", "memo", "hotkey"), show="tree headings", style="Library.Treeview", height=5
+        )
+        self.image_tree.column("#0", width=TREE_THUMBNAIL_SIZE[0] + 16, stretch=False)
+        for key, label, width in (("title", "名前", 130), ("size", "サイズ", 70), ("memo", "メモ", 120), ("hotkey", "ショートカット", 120)):
+            self.image_tree.heading(key, text=label)
+            self.image_tree.column(key, width=width)
+        self.image_tree.pack(fill="both", expand=True, pady=6)
+        self.image_tree.bind(
+            "<Button-3>",
+            lambda event: self._library_menu(
+                self.image_tree, event, self._paste_selected_image, self._copy_selected_image, self._edit_image, self._delete_image
+            ),
+        )
+        self.image_tree.bind("<Return>", lambda _: self._paste_selected_image())
+        self.image_tree.bind("<Delete>", lambda _: self._delete_image())
+        bar = ttk.Frame(right)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="追加", command=self._add_image).pack(side="left")
+        ttk.Button(bar, text="編集", command=self._edit_image).pack(side="left", padx=4)
+        ttk.Button(bar, text="削除", command=self._delete_image).pack(side="left")
+        ttk.Button(bar, text="↑", width=3, command=lambda: self._move_image(-1)).pack(side="left", padx=(8, 2))
+        ttk.Button(bar, text="↓", width=3, command=lambda: self._move_image(1)).pack(side="left")
+        ttk.Button(bar, text="貼り付け", command=self._paste_selected_image).pack(side="right")
+        ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_image).pack(side="right", padx=6)
 
     def _build_snippet_tab(self) -> None:
         outer = ttk.Panedwindow(self.snippet_tab, orient="horizontal")
@@ -670,6 +813,8 @@ class ShinClipboardApp:
                     self.undo_fifo()
                 elif event == "paste_text":
                     self._paste_text(str(payload))
+                elif event == "paste_image":
+                    self._paste_stored_image(str(payload))
                 elif event == "paste_failed":
                     self.status_var.set("自動貼り付けに失敗しました。貼り付け先で手動で貼り付けてください。")
                 elif event == "apply_transform":
@@ -715,6 +860,8 @@ class ShinClipboardApp:
     def _refresh_all(self) -> None:
         self._refresh_history()
         self._refresh_groups()
+        self.color_groups.refresh()
+        self.image_groups.refresh()
         self._refresh_fifo()
         self._refresh_transforms()
         self._refresh_call_window()
@@ -728,6 +875,8 @@ class ShinClipboardApp:
         for index, item in enumerate(self.visible_history):
             if item.kind == "image":
                 preview = f"[画像] {item.width}×{item.height}  {Path(item.image_path).name[:12]}"
+            elif parse_hex_color(item.text) is not None:
+                preview = f"[色] {item.text.strip()}"
             else:
                 preview = item.text.replace("\r", " ").replace("\n", " ↵ ")
             self.history_list.insert("end", preview[:180])
@@ -742,7 +891,11 @@ class ShinClipboardApp:
 
     def _refresh_call_window(self) -> None:
         self._refresh_call_history()
-        self._refresh_call_snippets()
+        for page in self.call_pages.values():
+            self._refresh_call_page(page)
+
+    def _refresh_call_snippets(self) -> None:
+        self._refresh_call_page(self.call_pages[1])
 
     def _refresh_call_history(self) -> None:
         if not hasattr(self, "call_history_list"):
@@ -753,8 +906,11 @@ class ShinClipboardApp:
         for index, item in enumerate(self.call_history_items):
             prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
             thumbnail = self._thumbnail(item.image_path) if item.kind == "image" else None
+            rgba = parse_hex_color(item.text) if item.kind == "text" else None
             if thumbnail is not None:
                 self.call_history_list.insert("end", prefix, image=thumbnail, suffix=f" {item.width}×{item.height}")
+            elif rgba is not None:
+                self.call_history_list.insert("end", prefix, image=self._swatch(rgba), suffix=f" {item.text.strip()}")
             else:
                 if item.kind == "image":
                     preview = f"[画像] {item.width}×{item.height}"
@@ -769,51 +925,61 @@ class ShinClipboardApp:
                 selectforeground="#ffffff",
             )
         referenced = {item.image_path for item in self.call_history_items if item.kind == "image"}
+        referenced |= library_image_paths(self.config)
         self._thumbnails = {path: photo for path, photo in self._thumbnails.items() if path in referenced}
 
     def _thumbnail(self, image_path: str) -> ImageTk.PhotoImage | None:
         """Return a cached, scaled-down PhotoImage for a stored image, or None if unreadable."""
-        cached = self._thumbnails.get(image_path)
+        return self._scaled_photo(self._thumbnails, image_path, THUMBNAIL_SIZE, self.call_window)
+
+    def _tree_thumbnail(self, image_path: str) -> ImageTk.PhotoImage | None:
+        """The same picture at the size of the image tab's rows."""
+        return self._scaled_photo(self._tree_thumbnails, image_path, TREE_THUMBNAIL_SIZE, self.root)
+
+    def _scaled_photo(self, cache: dict, image_path: str, size: tuple[int, int], master) -> ImageTk.PhotoImage | None:
+        cached = cache.get(image_path)
         if cached is not None:
             return cached
         try:
             with Image.open(self.store.image_path(image_path)) as source:
                 image = source.convert("RGBA")
-            image.thumbnail(THUMBNAIL_SIZE)
-            photo = ImageTk.PhotoImage(image, master=self.call_window)
+            image.thumbnail(size)
+            photo = ImageTk.PhotoImage(image, master=master)
         except (OSError, ValueError):
             return None
-        self._thumbnails[image_path] = photo
+        cache[image_path] = photo
         return photo
 
-    def _refresh_call_snippets(self) -> None:
-        if not hasattr(self, "call_snippet_list"):
-            return
-        self.call_snippet_items = []
-        self.call_snippet_list.delete(0, "end")
-        groups = self.config["groups"]
-        self.call_group_combo.configure(values=[group["name"] for group in groups])
-        if not groups:
-            self.call_group_id = None
-            self.call_group_var.set("")
-            return
+    def _swatch(self, rgba: tuple[int, int, int, int]) -> ImageTk.PhotoImage:
+        """A small block of the colour; there are few distinct ones, so none is ever evicted."""
+        photo = self._swatches.get(rgba)
+        if photo is None:
+            photo = ImageTk.PhotoImage(swatch_image(rgba), master=self.root)
+            self._swatches[rgba] = photo
+        return photo
 
-        group_index = next(
-            (index for index, group in enumerate(groups) if group["id"] == self.call_group_id),
-            0,
-        )
+    # ----- popup pages (definitions / colours / images) ---------------------------
+
+    def _refresh_call_page(self, page: CallPage) -> None:
+        page.items = []
+        page.listbox.delete(0, "end")
+        groups = self.config[page.groups_key]
+        page.combo.configure(values=[group["name"] for group in groups])
+        if not groups:
+            page.group_id = None
+            page.var.set("")
+            return
+        group_index = next((index for index, group in enumerate(groups) if group["id"] == page.group_id), 0)
         group = groups[group_index]
-        self.call_group_id = group["id"]
-        self.call_group_combo.current(group_index)
+        page.group_id = group["id"]
+        page.combo.current(group_index)
         colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
-        for snippet in group.get("snippets", []):
-            index = len(self.call_snippet_items)
-            self.call_snippet_items.append(snippet)
-            preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")
+        for item in group.get(page.items_key, []):
+            index = len(page.items)
+            page.items.append(item)
             prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
-            label = f"{prefix}{snippet['title']}  —  {preview[:130]}"
-            self.call_snippet_list.insert("end", label)
-            self.call_snippet_list.itemconfigure(
+            page.render(prefix, item)
+            page.listbox.itemconfigure(
                 index,
                 background=colors["stripe"] if index % 2 else colors["background"],
                 foreground=colors["foreground"],
@@ -821,12 +987,37 @@ class ShinClipboardApp:
                 selectforeground="#ffffff",
             )
 
-    def _call_group_changed(self, _event=None) -> None:
-        index = self.call_group_combo.current()
-        groups = self.config["groups"]
+    def _render_snippet_row(self, prefix: str, snippet: dict) -> None:
+        preview = snippet["text"].replace("\r", " ").replace("\n", " ↵ ")
+        self.call_pages[1].listbox.insert("end", f"{prefix}{snippet['title']}  —  {preview[:130]}")
+
+    def _render_color_row(self, prefix: str, color: dict) -> None:
+        listbox = self.call_pages[2].listbox
+        rgba = parse_hex_color(color.get("value", ""))
+        suffix = f" {color['title']}  {color.get('value', '')}"
+        if rgba is None:
+            listbox.insert("end", prefix + suffix.strip())
+        else:
+            listbox.insert("end", prefix, image=self._swatch(rgba), suffix=suffix)
+
+    def _render_image_row(self, prefix: str, entry: dict) -> None:
+        listbox = self.call_pages[3].listbox
+        size = f"{entry.get('width', 0)}×{entry.get('height', 0)}"
+        thumbnail = self._thumbnail(entry.get("image_path", ""))
+        if thumbnail is None:
+            listbox.insert("end", f"{prefix}{entry['title']}  [画像] {size}")
+        else:
+            listbox.insert("end", f"{prefix}{entry['title']}  ", image=thumbnail, suffix=f" {size}")
+
+    def _current_call_page(self) -> CallPage | None:
+        return self.call_pages.get(self.call_tabs.index("current"))
+
+    def _call_group_changed(self, page: CallPage) -> None:
+        index = page.combo.current()
+        groups = self.config[page.groups_key]
         if 0 <= index < len(groups):
-            self.call_group_id = groups[index]["id"]
-            self._refresh_call_snippets()
+            page.group_id = groups[index]["id"]
+            self._refresh_call_page(page)
             self._focus_call_list()
 
     def _move_call_tab(self, offset: int):
@@ -837,13 +1028,14 @@ class ShinClipboardApp:
         return "break"
 
     def _move_call_group(self, offset: int):
-        groups = self.config["groups"]
-        if not groups or self.call_tabs.index("current") != 1:
+        page = self._current_call_page()
+        groups = self.config[page.groups_key] if page else []
+        if not page or not groups:
             return "break"
-        current = max(0, self.call_group_combo.current())
+        current = max(0, page.combo.current())
         target = (current + offset) % len(groups)
-        self.call_group_id = groups[target]["id"]
-        self._refresh_call_snippets()
+        page.group_id = groups[target]["id"]
+        self._refresh_call_page(page)
         self._focus_call_list()
         return "break"
 
@@ -856,15 +1048,54 @@ class ShinClipboardApp:
 
     def _history_right_click(self, event):
         index = self.history_list.nearest(event.y)
-        if 0 <= index < self.history_list.size():
-            self.history_list.selection_clear(0, "end")
-            self.history_list.selection_set(index)
+        if not 0 <= index < self.history_list.size():
+            return "break"
+        self.history_list.selection_clear(0, "end")
+        self.history_list.selection_set(index)
+        item = self.visible_history[index]
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="貼り付け", command=self._paste_selected_history)
+        menu.add_command(label="クリップボードへ", command=self._copy_selected_history)
+        if item.kind == "image":
+            menu.add_command(label="画像を編集", command=self._edit_selected_history_image)
+            menu.add_command(label="画像に登録...", command=lambda: self._register_history_image(item))
+        else:
+            menu.add_command(label="編集", command=self._edit_history)
+            if parse_hex_color(item.text) is not None:
+                menu.add_command(label="色に登録...", command=lambda: self._register_history_color(item))
+        menu.add_separator()
+        menu.add_command(label="削除", command=self._delete_history)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
         return "break"
 
     def _snippet_right_click(self, event):
-        item_id = self.snippet_tree.identify_row(event.y)
+        return self._tree_right_click(self.snippet_tree, event)
+
+    @staticmethod
+    def _tree_right_click(tree: ttk.Treeview, event):
+        item_id = tree.identify_row(event.y)
         if item_id:
-            self.snippet_tree.selection_set(item_id)
+            tree.selection_set(item_id)
+        return "break"
+
+    def _library_menu(self, tree: ttk.Treeview, event, paste, copy, edit, delete) -> str:
+        """Right-click on a colour or image row: the same actions as the buttons under the table."""
+        if not tree.identify_row(event.y):
+            return "break"
+        self._tree_right_click(tree, event)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="貼り付け", command=paste)
+        menu.add_command(label="クリップボードへ", command=copy)
+        menu.add_command(label="編集", command=edit)
+        menu.add_separator()
+        menu.add_command(label="削除 (Delete)", command=delete)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
         return "break"
 
     def _quick_select(self, event):
@@ -883,25 +1114,28 @@ class ShinClipboardApp:
         if len(key) != 1 or key not in QUICK_KEYS:
             return None
         index = QUICK_KEYS.index(key)
-        selected_tab = self.call_tabs.select()
-        if selected_tab == self.call_tabs.tabs()[0] and index < len(self.call_history_items):
+        page = self._current_call_page()
+        if page is None:
+            if index >= len(self.call_history_items):
+                return None
             self.call_history_list.selection_clear(0, "end")
             self.call_history_list.selection_set(index)
             self.call_history_list.see(index)
             self._paste_call_history()
             return "break"
-        if selected_tab == self.call_tabs.tabs()[1] and index < len(self.call_snippet_items):
-            self.call_snippet_list.selection_clear(0, "end")
-            self.call_snippet_list.selection_set(index)
-            self.call_snippet_list.see(index)
-            self._paste_call_snippet()
+        if index < len(page.items):
+            page.listbox.selection_clear(0, "end")
+            page.listbox.selection_set(index)
+            page.listbox.see(index)
+            self._paste_call_page(page)
             return "break"
         return None
 
     def _focus_call_list(self, _event=None) -> None:
         if not hasattr(self, "call_tabs"):
             return
-        widget = self.call_history_list if self.call_tabs.index("current") == 0 else self.call_snippet_list
+        page = self._current_call_page()
+        widget = self.call_history_list if page is None else page.listbox
         if widget.size() and not widget.curselection():
             widget.selection_set(0)
         self.call_window.after_idle(widget.focus_set)
@@ -924,42 +1158,114 @@ class ShinClipboardApp:
             self.call_window.after_idle(self._paste_call_history)
 
     def _setup_drag_source(self) -> None:
-        """Let history rows be dragged into other applications (images as files, text as text)."""
+        """Let popup rows be dragged into other applications (images as files, text as text)."""
         self.drag_enabled = False
         self._drag_active = False
         try:
             from tkinterdnd2 import TkinterDnD
 
             TkinterDnD._require(self.root)
-            widget = self.call_history_list
-            widget.drag_source_register(1, "DND_Files", "DND_Text")
-            widget.dnd_bind("<<DragInitCmd>>", self._drag_init)
-            widget.dnd_bind("<<DragEndCmd>>", self._drag_end)
+            sources = [(self.call_history_list, None)] + [(page.listbox, page) for page in self.call_pages.values()]
+            for widget, page in sources:
+                widget.drag_source_register(1, "DND_Files", "DND_Text")
+                widget.dnd_bind("<<DragInitCmd>>", lambda event, page=page: self._drag_init(event, page))
+                widget.dnd_bind("<<DragEndCmd>>", self._drag_end)
+            # Picture files dropped from Explorer / Finder go straight into the image library.
+            for widget, page in ((self.image_tree, None), (self.call_pages[3].listbox, self.call_pages[3])):
+                widget.drop_target_register("DND_Files", "DND_Text")
+                widget.dnd_bind("<<Drop>>", lambda event, page=page: self._drop_images(event, page))
         except (ImportError, RuntimeError, tk.TclError) as error:
             self.status_var.set(f"ドラッグ＆ドロップは利用できません: {error}")
             return
         self.drag_enabled = True
 
-    def _drag_init(self, _event=None):
-        """tkdnd <<DragInitCmd>>: describe what the selected history row drops as."""
-        selected = self.call_history_list.curselection()
-        if not selected or selected[0] >= len(self.call_history_items):
-            return ("refuse_drop",)
-        item = self.call_history_items[selected[0]]
-        if item.kind == "image":
-            try:
-                path = self.store.image_path(item.image_path)
-            except ValueError:
-                return ("refuse_drop",)
-            if not path.exists():
-                return ("refuse_drop",)
-            payload = ("copy", "DND_Files", (str(path),))
-        elif item.text:
-            payload = ("copy", "DND_Text", item.text)
+    def _drop_images(self, event, page: CallPage | None = None):
+        """tkdnd <<Drop>>: register every picture file dropped, named after the file.
+
+        No page means the settings tab, where a group is asked for when there is
+        none; the popup only ever adds to the group it is showing.
+        """
+        if self._drag_active:
+            return "refuse_drop"  # a row of our own popup let go over the list
+        if page is None:
+            group = self._ensure_group(self.image_groups)
         else:
-            return ("refuse_drop",)
+            groups = self.config["image_groups"]
+            group = next((candidate for candidate in groups if candidate["id"] == page.group_id), None)
+        if not group:
+            self.status_var.set("先に画像のグループを追加してください。")
+            return "refuse_drop"
+        added = skipped = 0
+        for path in self._dropped_paths(getattr(event, "data", "")):
+            try:
+                with Image.open(path) as opened:
+                    picture = opened.convert("RGBA")
+            except (OSError, ValueError):
+                skipped += 1
+                continue
+            entry = {"id": str(uuid4()), "title": path.stem, "memo": "", "hotkey": ""}
+            entry["image_path"], entry["width"], entry["height"] = self.store.save_library_image(picture)
+            group["images"].append(entry)
+            added += 1
+        if added:
+            self._save_config()
+            self.image_groups.refresh()  # redraws the settings table and, through it, the popup page
+        summary = f"画像を{added}件登録しました"
+        if skipped:
+            summary += f"（画像として読めない{skipped}件は飛ばしました）"
+        self.status_var.set(summary if added or skipped else "画像ファイルをドロップしてください。")
+        return "copy" if added else "refuse_drop"
+
+    def _dropped_paths(self, data: str) -> list[Path]:
+        """The files in a drop payload: a Tcl list of paths, or file URLs from some browsers."""
+        try:
+            raw = self.root.tk.splitlist(data)
+        except tk.TclError:
+            raw = data.split()
+        paths: list[Path] = []
+        for item in raw:
+            text = str(item).strip()
+            if text.startswith("file://"):
+                from urllib.parse import unquote, urlparse
+
+                text = unquote(urlparse(text).path)
+                if text.startswith("/") and len(text) > 2 and text[2] == ":":
+                    text = text[1:]  # file:///C:/... keeps a leading slash on Windows
+            path = Path(text)
+            if path.is_file():
+                paths.append(path)
+        return paths
+
+    def _drag_init(self, _event=None, page: CallPage | None = None):
+        """tkdnd <<DragInitCmd>>: describe what the selected row drops as. No page means the history."""
+        if page is None:
+            selected = self.call_history_list.curselection()
+            if not selected or selected[0] >= len(self.call_history_items):
+                return ("refuse_drop",)
+            item = self.call_history_items[selected[0]]
+            payload = self._drag_payload(item.image_path if item.kind == "image" else "", item.text)
+        else:
+            selected = page.listbox.curselection()
+            if not selected or selected[0] >= len(page.items):
+                return ("refuse_drop",)
+            item = page.items[selected[0]]
+            if page.items_key == "images":
+                payload = self._drag_payload(item.get("image_path", ""), "")
+            else:
+                payload = self._drag_payload("", item.get("value") or item.get("text") or "")
+        if payload == ("refuse_drop",):
+            return payload
         self._drag_active = True
         return payload
+
+    def _drag_payload(self, image_path: str, text: str):
+        if image_path:
+            try:
+                path = self.store.image_path(image_path)
+            except ValueError:
+                return ("refuse_drop",)
+            return ("copy", "DND_Files", (str(path),)) if path.exists() else ("refuse_drop",)
+        return ("copy", "DND_Text", text) if text else ("refuse_drop",)
 
     def _drag_end(self, event=None) -> None:
         """tkdnd <<DragEndCmd>>: hide the popup after a successful drop."""
@@ -972,12 +1278,17 @@ class ShinClipboardApp:
     def _finish_drag(self) -> None:
         self._drag_active = False
 
-    def _call_snippet_click(self, event) -> None:
-        index = self._clicked_list_row(self.call_snippet_list, event.y)
+    def _call_page_click(self, page: CallPage, event) -> None:
+        if self._drag_active:
+            return  # the button release belongs to a drag & drop, not a click
+        index = self._clicked_list_row(page.listbox, event.y)
         if index is not None:
-            self.call_snippet_list.selection_clear(0, "end")
-            self.call_snippet_list.selection_set(index)
-            self.call_window.after_idle(self._paste_call_snippet)
+            page.listbox.selection_clear(0, "end")
+            page.listbox.selection_set(index)
+            self.call_window.after_idle(lambda: self._paste_call_page(page))
+
+    def _call_snippet_click(self, event) -> None:
+        self._call_page_click(self.call_pages[1], event)
 
     def _paste_call_history(self) -> None:
         selected = self.call_history_list.curselection()
@@ -985,30 +1296,49 @@ class ShinClipboardApp:
             return
         item = self.call_history_items[selected[0]]
         if item.kind == "image":
-            try:
-                self._set_clipboard_image(self.store.image_path(item.image_path))
-            except (ImportError, OSError, RuntimeError, ValueError) as error:
-                messagebox.showerror("画像履歴", str(error), parent=self.call_window)
-                return
-            if self.config["settings"].get("auto_paste", True):
-                self._send_paste()
+            self._paste_stored_image(item.image_path, self.call_window)
         else:
             self._paste_text(item.text)
 
+    def _paste_call_page(self, page: CallPage) -> None:
+        selected = page.listbox.curselection()
+        if not selected or selected[0] >= len(page.items):
+            return
+        self._paste_library_item(page.items_key, page.items[selected[0]], self.call_window)
+
     def _paste_call_snippet(self) -> None:
-        selected = self.call_snippet_list.curselection()
-        if selected:
-            self._paste_text(self.call_snippet_items[selected[0]]["text"])
+        self._paste_call_page(self.call_pages[1])
+
+    def _paste_library_item(self, items_key: str, item: dict, parent: tk.Misc | None = None) -> None:
+        if items_key == "images":
+            self._paste_stored_image(item.get("image_path", ""), parent)
+        elif items_key == "colors":
+            self._paste_text(item["value"])
+        else:
+            self._paste_text(item["text"])
+
+    def _paste_stored_image(self, relative: str, parent: tk.Misc | None = None) -> bool:
+        """Put a stored picture on the clipboard and, when enabled, paste it where the user was."""
+        if not self._copy_stored_image(relative, parent):
+            return False
+        if self.config["settings"].get("auto_paste", True):
+            self._send_paste()
+        return True
+
+    def _copy_stored_image(self, relative: str, parent: tk.Misc | None = None) -> bool:
+        try:
+            self._set_clipboard_image(self.store.image_path(relative))
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror("画像", str(error), parent=parent or self.root)
+            return False
+        return True
 
     def _copy_selected_history(self) -> None:
         item = self._selected_history()
         if item:
             if item.kind == "image":
-                try:
-                    self._set_clipboard_image(self.store.image_path(item.image_path))
+                if self._copy_stored_image(item.image_path):
                     self.status_var.set("画像をクリップボードへコピーしました")
-                except (ImportError, OSError, RuntimeError, ValueError) as error:
-                    messagebox.showerror("画像履歴", str(error))
             else:
                 self._set_clipboard(item.text)
                 self.status_var.set("履歴をクリップボードへコピーしました")
@@ -1017,13 +1347,7 @@ class ShinClipboardApp:
         item = self._selected_history()
         if item:
             if item.kind == "image":
-                try:
-                    self._set_clipboard_image(self.store.image_path(item.image_path))
-                except (ImportError, OSError, RuntimeError, ValueError) as error:
-                    messagebox.showerror("画像履歴", str(error))
-                    return
-                if self.config["settings"].get("auto_paste", True):
-                    self._send_paste()
+                self._paste_stored_image(item.image_path)
             else:
                 self._paste_text(item.text)
 
@@ -1279,6 +1603,381 @@ class ShinClipboardApp:
         snippet = self._selected_snippet()
         if snippet:
             self._paste_text(snippet["text"])
+
+    # ----- colour and image libraries ---------------------------------------------
+
+    def _library_changed(self) -> None:
+        """A group was added, renamed, removed or moved in the colour or image tab."""
+        self._save_config(restart_hotkeys=True)
+        self.store.cleanup_library(self.config)
+        self._refresh_call_window()
+
+    @staticmethod
+    def _ensure_group(panel: GroupPanel) -> dict | None:
+        """The selected group, or a freshly named one when the tab has none yet."""
+        return panel.selected_group() or panel.add()
+
+    @staticmethod
+    def _selected_tree_item(tree: ttk.Treeview, group: dict | None, items_key: str) -> dict | None:
+        selected = tree.selection()
+        if not group or not selected:
+            return None
+        return next((item for item in group.get(items_key, []) if item["id"] == selected[0]), None)
+
+    def _refresh_colors(self) -> None:
+        for row in self.color_tree.get_children():
+            self.color_tree.delete(row)
+        group = self.color_groups.selected_group()
+        for color in (group or {}).get("colors", []):
+            rgba = parse_hex_color(color.get("value", ""))
+            options = {"image": self._swatch(rgba)} if rgba is not None else {}
+            self.color_tree.insert(
+                "", "end", iid=color["id"],
+                values=(color["title"], color.get("value", ""), color.get("memo", ""), color.get("hotkey", "")),
+                **options,
+            )
+        if 2 in self.call_pages:
+            self._refresh_call_page(self.call_pages[2])
+
+    def _selected_color(self) -> dict | None:
+        return self._selected_tree_item(self.color_tree, self.color_groups.selected_group(), "colors")
+
+    def _color_dialog(self, color: dict | None = None, initial_value: str = "", parent: tk.Misc | None = None) -> dict | None:
+        owner = parent or self.root
+        dialog = tk.Toplevel(owner)
+        dialog.title("色の編集" if color else "色の追加")
+        dialog.geometry("480x300")
+        dialog.transient(owner)
+        dialog.grab_set()
+        title_var = tk.StringVar(value=color.get("title", "") if color else "")
+        value_var = tk.StringVar(value=color.get("value", "") if color else initial_value)
+        memo_var = tk.StringVar(value=color.get("memo", "") if color else "")
+        hotkey_var = tk.StringVar(value=color.get("hotkey", "") if color else "")
+        form = ttk.Frame(dialog, padding=14)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="名前").grid(row=0, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Entry(form, textvariable=title_var).grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(form, text="値").grid(row=1, column=0, sticky="w", pady=6, padx=(0, 12))
+        value_row = ttk.Frame(form)
+        value_row.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Entry(value_row, textvariable=value_var, width=14).pack(side="left")
+        # A plain tk label: ttk labels take their background from the theme.
+        preview = tk.Label(value_row, width=6, relief="solid", borderwidth=1)
+        preview.pack(side="left", padx=8, fill="y")
+        default_background = preview.cget("background")
+
+        def show_preview(*_) -> None:
+            rgba = parse_hex_color(value_var.get())
+            preview.configure(background=f"#{rgba[0]:02x}{rgba[1]:02x}{rgba[2]:02x}" if rgba else default_background)
+
+        def choose() -> None:
+            rgba = parse_hex_color(value_var.get())
+            current = f"#{rgba[0]:02x}{rgba[1]:02x}{rgba[2]:02x}" if rgba else None
+            _, chosen = colorchooser.askcolor(color=current, parent=dialog, title="色を選ぶ")
+            if chosen:
+                value_var.set(chosen)
+
+        ttk.Button(value_row, text="選ぶ…", command=choose).pack(side="left")
+        value_var.trace_add("write", show_preview)
+        show_preview()
+        ttk.Label(form, text="#RGB / #RRGGBB / #RRGGBBAA。登録した表記のまま貼り付けます。", style="Muted.TLabel").grid(
+            row=2, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Label(form, text="メモ").grid(row=3, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Entry(form, textvariable=memo_var).grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(form, text="ショートカット").grid(row=4, column=0, sticky="w", pady=6, padx=(0, 12))
+        ttk.Entry(form, textvariable=hotkey_var).grid(row=4, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(form, text="任意、例: primary+alt+1", style="Muted.TLabel").grid(row=5, column=1, sticky="w")
+        result: list[dict] = []
+
+        def accept() -> None:
+            title = title_var.get().strip()
+            value = value_var.get().strip()
+            if not title:
+                messagebox.showwarning("入力不足", "名前を入力してください。", parent=dialog)
+                return
+            if parse_hex_color(value) is None:
+                messagebox.showwarning("色", "値は #RRGGBB のような16進表記で入力してください。", parent=dialog)
+                return
+            result.append({
+                "id": color.get("id", str(uuid4())) if color else str(uuid4()),
+                "title": title,
+                "value": value,
+                "memo": memo_var.get().strip(),
+                "hotkey": hotkey_var.get().strip().lower(),
+            })
+            dialog.destroy()
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=6, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="保存", command=accept).pack(side="right")
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="right", padx=6)
+        dialog.wait_window()
+        return result[0] if result else None
+
+    def _add_color(self, initial_value: str = "") -> None:
+        group = self._ensure_group(self.color_groups)
+        if not group:
+            return
+        value = self._color_dialog(initial_value=initial_value)
+        if value:
+            group["colors"].append(value)
+            self._save_config(restart_hotkeys=True)
+            self._refresh_colors()
+            self.color_tree.selection_set(value["id"])
+
+    def _edit_color(self) -> None:
+        group = self.color_groups.selected_group()
+        color = self._selected_color()
+        if not group or not color:
+            return
+        value = self._color_dialog(color)
+        if value:
+            group["colors"][group["colors"].index(color)] = value
+            self._save_config(restart_hotkeys=True)
+            self._refresh_colors()
+            self.color_tree.selection_set(value["id"])
+
+    def _delete_color(self) -> None:
+        group = self.color_groups.selected_group()
+        color = self._selected_color()
+        if group and color and messagebox.askyesno("色の削除", f"「{color['title']}」を削除しますか？"):
+            group["colors"].remove(color)
+            self._save_config(restart_hotkeys=True)
+            self._refresh_colors()
+
+    def _move_color(self, offset: int) -> None:
+        self._move_library_item(self.color_groups.selected_group(), "colors", self._selected_color(), offset, self.color_tree)
+        self._refresh_colors()
+
+    def _move_library_item(self, group: dict | None, items_key: str, item: dict | None, offset: int, tree: ttk.Treeview) -> None:
+        if not group or not item:
+            return
+        items = group[items_key]
+        index = items.index(item)
+        target = index + offset
+        if not 0 <= target < len(items):
+            return
+        items[index], items[target] = items[target], items[index]
+        self._save_config()
+        tree.after_idle(lambda: tree.selection_set(item["id"]))
+
+    def _paste_selected_color(self) -> None:
+        color = self._selected_color()
+        if color:
+            self._paste_text(color["value"])
+
+    def _copy_selected_color(self) -> None:
+        color = self._selected_color()
+        if color:
+            self._set_clipboard(color["value"])
+            self.status_var.set(f"色をクリップボードへコピーしました: {color['value']}")
+
+    def _register_history_color(self, item: HistoryItem) -> None:
+        """Turn a copied colour code into a library entry."""
+        self.tabs.select(self.color_tab)
+        self._add_color(initial_value=item.text.strip())
+
+    def _refresh_images(self) -> None:
+        for row in self.image_tree.get_children():
+            self.image_tree.delete(row)
+        group = self.image_groups.selected_group()
+        for entry in (group or {}).get("images", []):
+            thumbnail = self._tree_thumbnail(entry.get("image_path", ""))
+            options = {"image": thumbnail} if thumbnail is not None else {}
+            size = f"{entry.get('width', 0)}×{entry.get('height', 0)}"
+            self.image_tree.insert(
+                "", "end", iid=entry["id"],
+                values=(entry["title"], size, entry.get("memo", ""), entry.get("hotkey", "")),
+                **options,
+            )
+        referenced = library_image_paths(self.config)
+        self._tree_thumbnails = {path: photo for path, photo in self._tree_thumbnails.items() if path in referenced}
+        if 3 in self.call_pages:
+            self._refresh_call_page(self.call_pages[3])
+
+    def _selected_image(self) -> dict | None:
+        return self._selected_tree_item(self.image_tree, self.image_groups.selected_group(), "images")
+
+    def _image_dialog(self, entry: dict | None = None, image: Image.Image | None = None, parent: tk.Misc | None = None) -> dict | None:
+        """Ask for an image entry. The returned dict carries a new picture under "image" until it is stored."""
+        owner = parent or self.root
+        dialog = tk.Toplevel(owner)
+        dialog.title("画像の編集" if entry else "画像の追加")
+        dialog.geometry("520x460")
+        dialog.transient(owner)
+        dialog.grab_set()
+        title_var = tk.StringVar(value=entry.get("title", "") if entry else "")
+        memo_var = tk.StringVar(value=entry.get("memo", "") if entry else "")
+        hotkey_var = tk.StringVar(value=entry.get("hotkey", "") if entry else "")
+        chosen: dict[str, object] = {"image": image}
+        form = ttk.Frame(dialog, padding=14)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(1, weight=1)
+        for row, (label, variable) in enumerate((("名前", title_var), ("メモ", memo_var), ("ショートカット", hotkey_var))):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+            ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=6)
+        ttk.Label(form, text="ショートカットは任意、例: primary+alt+1", style="Muted.TLabel").grid(row=3, column=1, sticky="w")
+        picture = ttk.LabelFrame(form, text="画像", padding=10)
+        picture.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        form.rowconfigure(4, weight=1)
+        sources = ttk.Frame(picture)
+        sources.pack(fill="x")
+        size_var = tk.StringVar(value="未選択")
+        preview = tk.Label(picture, textvariable=size_var, compound="top", anchor="center")
+        preview.pack(fill="both", expand=True, pady=(8, 0))
+
+        def show(source: Image.Image | None) -> None:
+            if source is None:
+                preview.configure(image="")
+                size_var.set("未選択")
+                return
+            thumbnail = source.copy()
+            thumbnail.thumbnail((240, 160))
+            photo = ImageTk.PhotoImage(thumbnail, master=dialog)
+            preview.configure(image=photo)
+            preview.image = photo  # keep a reference or Tk drops the picture
+            size_var.set(f"{source.width}×{source.height}")
+
+        def pick_file() -> None:
+            path = filedialog.askopenfilename(
+                title="画像を選ぶ",
+                filetypes=[("画像", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("すべて", "*.*")],
+                parent=dialog,
+            )
+            if not path:
+                return
+            try:
+                with Image.open(path) as opened:
+                    chosen["image"] = opened.convert("RGBA")
+            except (OSError, ValueError) as error:
+                messagebox.showerror("画像", f"画像を開けません: {error}", parent=dialog)
+                return
+            if not title_var.get().strip():
+                title_var.set(Path(path).stem)
+            show(chosen["image"])
+
+        def from_clipboard() -> None:
+            clipboard = read_clipboard_image()
+            if clipboard is None:
+                messagebox.showinfo("画像", "クリップボードに画像がありません。", parent=dialog)
+                return
+            chosen["image"] = clipboard.convert("RGBA")
+            show(chosen["image"])
+
+        ttk.Button(sources, text="ファイルを選ぶ…", command=pick_file).pack(side="left")
+        ttk.Button(sources, text="クリップボードの画像", command=from_clipboard).pack(side="left", padx=6)
+        if image is not None:
+            show(image)
+        elif entry and entry.get("image_path"):
+            try:
+                with Image.open(self.store.image_path(entry["image_path"])) as opened:
+                    show(opened.convert("RGBA"))
+            except (OSError, ValueError):
+                size_var.set("画像ファイルが見つかりません")
+        result: list[dict] = []
+
+        def accept() -> None:
+            title = title_var.get().strip()
+            if not title:
+                messagebox.showwarning("入力不足", "名前を入力してください。", parent=dialog)
+                return
+            if chosen["image"] is None and not (entry and entry.get("image_path")):
+                messagebox.showwarning("入力不足", "画像を選んでください。", parent=dialog)
+                return
+            result.append({
+                "id": entry.get("id", str(uuid4())) if entry else str(uuid4()),
+                "title": title,
+                "memo": memo_var.get().strip(),
+                "hotkey": hotkey_var.get().strip().lower(),
+                "image_path": entry.get("image_path", "") if entry else "",
+                "width": int(entry.get("width", 0)) if entry else 0,
+                "height": int(entry.get("height", 0)) if entry else 0,
+                "image": chosen["image"],
+            })
+            dialog.destroy()
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="保存", command=accept).pack(side="right")
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="right", padx=6)
+        dialog.wait_window()
+        return result[0] if result else None
+
+    def _store_image_entry(self, value: dict) -> dict:
+        """Write the picture a dialog returned into the library and finish the entry."""
+        picture = value.pop("image", None)
+        if picture is not None:
+            value["image_path"], value["width"], value["height"] = self.store.save_library_image(picture)
+        return value
+
+    def _add_image(self, image: Image.Image | None = None) -> None:
+        group = self._ensure_group(self.image_groups)
+        if not group:
+            return
+        value = self._image_dialog(image=image)
+        if value:
+            group["images"].append(self._store_image_entry(value))
+            self._save_config(restart_hotkeys=True)
+            self._refresh_images()
+            self.image_tree.selection_set(value["id"])
+
+    def _edit_image(self) -> None:
+        group = self.image_groups.selected_group()
+        entry = self._selected_image()
+        if not group or not entry:
+            return
+        value = self._image_dialog(entry)
+        if value:
+            group["images"][group["images"].index(entry)] = self._store_image_entry(value)
+            self._save_config(restart_hotkeys=True)
+            self.store.cleanup_library(self.config)  # the replaced picture may be orphaned now
+            self._refresh_images()
+            self.image_tree.selection_set(value["id"])
+
+    def _delete_image(self) -> None:
+        group = self.image_groups.selected_group()
+        entry = self._selected_image()
+        if group and entry and messagebox.askyesno("画像の削除", f"「{entry['title']}」を削除しますか？"):
+            group["images"].remove(entry)
+            self._save_config(restart_hotkeys=True)
+            self.store.cleanup_library(self.config)
+            self._refresh_images()
+
+    def _move_image(self, offset: int) -> None:
+        self._move_library_item(self.image_groups.selected_group(), "images", self._selected_image(), offset, self.image_tree)
+        self._refresh_images()
+
+    def _paste_selected_image(self) -> None:
+        entry = self._selected_image()
+        if entry:
+            self._paste_stored_image(entry.get("image_path", ""))
+
+    def _copy_selected_image(self) -> None:
+        entry = self._selected_image()
+        if entry and self._copy_stored_image(entry.get("image_path", "")):
+            self.status_var.set("画像をクリップボードへコピーしました")
+
+    def _register_history_image(self, item: HistoryItem) -> None:
+        """Copy a history picture into the library; the history entry keeps its own file."""
+        try:
+            with Image.open(self.store.image_path(item.image_path)) as source:
+                picture = source.convert("RGBA")
+        except (OSError, ValueError) as error:
+            messagebox.showerror("画像", str(error), parent=self.root)
+            return
+        self.tabs.select(self.image_tab)
+        self._add_image(picture)
+
+    def _register_from_popup(self, item: HistoryItem) -> None:
+        """The popup's "register" entries: the dialog needs a visible owner, so the settings window opens."""
+        self.hide_call_window()
+        self.show_settings_window()
+        if item.kind == "image":
+            self._register_history_image(item)
+        else:
+            self._register_history_color(item)
 
     def _paste_text(self, text: str) -> None:
         self._set_clipboard(text)
@@ -1659,6 +2358,16 @@ class ShinClipboardApp:
                 if snippet.get("hotkey"):
                     text = snippet["text"]
                     mappings[snippet["hotkey"]] = lambda value=text: self.events.put(("paste_text", value))
+        for group in self.config.get("color_groups", []):
+            for color in group.get("colors", []):
+                if color.get("hotkey"):
+                    text = color["value"]
+                    mappings[color["hotkey"]] = lambda value=text: self.events.put(("paste_text", value))
+        for group in self.config.get("image_groups", []):
+            for entry in group.get("images", []):
+                if entry.get("hotkey") and entry.get("image_path"):
+                    path = entry["image_path"]
+                    mappings[entry["hotkey"]] = lambda value=path: self.events.put(("paste_image", value))
         for rule in self.config.get("transforms", []):
             if rule.get("hotkey"):
                 rule_id = rule["id"]
@@ -1673,8 +2382,10 @@ class ShinClipboardApp:
         if hasattr(self, "call_window"):
             self.call_window.configure(background=colors["background"])
         self.root.attributes("-topmost", bool(settings.get("always_on_top", False)))
-        for widget_name in ("history_list", "group_list", "fifo_list", "call_history_list", "call_snippet_list"):
-            widget = getattr(self, widget_name, None)
+        widgets = [getattr(self, name, None) for name in ("history_list", "group_list", "fifo_list", "call_history_list")]
+        widgets += [panel.listbox for panel in (getattr(self, "color_groups", None), getattr(self, "image_groups", None)) if panel]
+        widgets += [page.listbox for page in self.call_pages.values()]
+        for widget in widgets:
             if widget:
                 widget.configure(font=(UI_FONT_FAMILY, size), background=colors["background"], foreground=colors["foreground"], selectbackground=colors["accent"])
         style = ttk.Style()
@@ -1990,6 +2701,23 @@ class ShinClipboardApp:
         menu.add_command(label="貼り付け", command=self._paste_call_history)
         if item.kind == "image":
             menu.add_command(label="この画像を編集 (Ctrl+E)", command=self._edit_call_history_image)
+            menu.add_command(label="画像に登録...", command=lambda: self._register_from_popup(item))
+        elif parse_hex_color(item.text) is not None:
+            menu.add_command(label="色に登録...", command=lambda: self._register_from_popup(item))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _call_page_menu(self, page: CallPage, event) -> str:
+        index = self._clicked_list_row(page.listbox, event.y)
+        if index is None:
+            return "break"
+        page.listbox.selection_clear(0, "end")
+        page.listbox.selection_set(index)
+        menu = tk.Menu(self.call_window, tearoff=0)
+        menu.add_command(label="貼り付け", command=lambda: self._paste_call_page(page))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:

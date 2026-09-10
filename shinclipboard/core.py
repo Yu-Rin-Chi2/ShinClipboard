@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Iterable
 
+from .colors import is_hex_color
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -79,10 +81,16 @@ class ClipboardHistory:
         needle = query.casefold().strip()
         if not needle:
             return items
-        return [
-            item for item in items
-            if needle in item.text.casefold() or item.kind == "image" and needle in "画像 image".casefold()
-        ]
+        return [item for item in items if self._matches(item, needle)]
+
+    @staticmethod
+    def _matches(item: HistoryItem, needle: str) -> bool:
+        """Text matches by content; images and colours also answer to their kind."""
+        if needle in item.text.casefold():
+            return True
+        if item.kind == "image":
+            return needle in "画像 image"
+        return is_hex_color(item.text) and needle in "色 color"
 
     def to_list(self) -> list[dict[str, str]]:
         return [item.to_dict() for item in self.search()]

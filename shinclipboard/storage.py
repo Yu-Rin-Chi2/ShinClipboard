@@ -16,6 +16,7 @@ from .core import ClipboardHistory, HistoryItem
 
 
 SCHEMA_VERSION = 1
+LIBRARY_DIR = "library"  # pictures registered in the image library, next to `images/`
 # `Ctrl+Space` used to be the default popup hotkey. It collides with IME
 # toggling on Japanese Windows and was opened by accident too often, so it is
 # no longer offered and existing configs are migrated to "no hotkey".
@@ -71,7 +72,23 @@ def default_config() -> dict[str, Any]:
                 ],
             }
         ],
+        "color_groups": [
+            {
+                "id": str(uuid4()),
+                "name": "サンプル",
+                "colors": [
+                    {"id": str(uuid4()), "title": "ブルー", "value": "#075dcc", "memo": "", "hotkey": ""},
+                    {"id": str(uuid4()), "title": "レッド", "value": "#e02424", "memo": "", "hotkey": ""},
+                    {"id": str(uuid4()), "title": "半透明の黒", "value": "#00000080", "memo": "", "hotkey": ""},
+                ],
+            }
+        ],
+        "image_groups": [],
     }
+
+
+# Each library kind lives under its own key in the config, holding groups of items.
+LIBRARY_KINDS = {"colors": "color_groups", "images": "image_groups"}
 
 
 class JsonStore:
@@ -99,6 +116,13 @@ class JsonStore:
             group.setdefault("snippets", [])
             for snippet in group["snippets"]:
                 snippet.setdefault("memo", "")
+        for items_key, groups_key in LIBRARY_KINDS.items():
+            data.setdefault(groups_key, [])
+            for group in data[groups_key]:
+                group.setdefault(items_key, [])
+                for item in group[items_key]:
+                    item.setdefault("memo", "")
+                    item.setdefault("hotkey", "")
         if str(data["settings"].get("popup_hotkey", "")).strip().lower() == LEGACY_POPUP_HOTKEY:
             data["settings"]["popup_hotkey"] = ""
             self.save_config(data)
@@ -135,12 +159,24 @@ class JsonStore:
         self.cleanup_images(history)
 
     def save_image(self, image: Image.Image) -> tuple[str, int, int]:
+        return self._save_png(image, "images")
+
+    def save_library_image(self, image: Image.Image) -> tuple[str, int, int]:
+        """Store a picture for the image library.
+
+        It goes to its own folder: `cleanup_images` deletes every picture the
+        history no longer references, and a library image is meant to outlive
+        any history entry it may have started as.
+        """
+        return self._save_png(image, LIBRARY_DIR)
+
+    def _save_png(self, image: Image.Image, folder: str) -> tuple[str, int, int]:
         normalized = image.convert("RGBA")
         buffer = io.BytesIO()
         normalized.save(buffer, format="PNG")
         data = buffer.getvalue()
         digest = hashlib.sha256(data).hexdigest()
-        relative = Path("images") / f"{digest}.png"
+        relative = Path(folder) / f"{digest}.png"
         target = self.data_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
@@ -165,6 +201,20 @@ class JsonStore:
             if relative not in referenced:
                 path.unlink()
 
+    def cleanup_library(self, config: dict[str, Any]) -> None:
+        """Drop library pictures no image group refers to any more.
+
+        Called only when the user removes an image or a group, never on a plain
+        save: importing someone else's config must not wipe the local pictures.
+        """
+        library_dir = self.data_dir / LIBRARY_DIR
+        if not library_dir.exists():
+            return
+        referenced = library_image_paths(config)
+        for path in library_dir.glob("*.png"):
+            if path.relative_to(self.data_dir).as_posix() not in referenced:
+                path.unlink()
+
     @staticmethod
     def _read(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as stream:
@@ -186,6 +236,15 @@ class JsonStore:
         finally:
             if temporary_name and os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+
+def library_image_paths(config: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("image_path", ""))
+        for group in config.get("image_groups", [])
+        for item in group.get("images", [])
+        if item.get("image_path")
+    }
 
 
 def default_data_dir() -> Path:

@@ -1,7 +1,107 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from collections.abc import Callable
+from tkinter import messagebox, simpledialog, ttk
+from uuid import uuid4
+
+
+class GroupPanel(ttk.Frame):
+    """The group column of a library tab: a list plus add / rename / delete / reorder.
+
+    `groups` returns the live list of group dicts (each with "id" and "name");
+    the panel edits that list in place and then calls `on_change`, which is
+    where the owner persists it. `on_select` fires whenever the selection may
+    have moved, so the owner can show the chosen group's items.
+    """
+
+    def __init__(
+        self,
+        master,
+        groups: Callable[[], list[dict]],
+        items_key: str,
+        noun: str,
+        on_change: Callable[[], None],
+        on_select: Callable[[], None],
+        font=None,
+    ):
+        super().__init__(master, padding=(0, 0, 8, 0))
+        self._groups = groups
+        self._items_key = items_key
+        self._noun = noun
+        self._on_change = on_change
+        self._on_select = on_select
+        ttk.Label(self, text="グループ").pack(anchor="w")
+        self.listbox = tk.Listbox(self, exportselection=False, font=font)
+        self.listbox.pack(fill="both", expand=True, pady=6)
+        self.listbox.bind("<<ListboxSelect>>", lambda _: self._on_select())
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="追加", command=self.add).pack(side="left")
+        ttk.Button(bar, text="名前変更", command=self.rename).pack(side="left", padx=4)
+        ttk.Button(bar, text="削除", command=self.delete).pack(side="left", padx=4)
+        ttk.Button(bar, text="↑", width=3, command=lambda: self.move(-1)).pack(side="left")
+        ttk.Button(bar, text="↓", width=3, command=lambda: self.move(1)).pack(side="left", padx=2)
+
+    def selected_index(self) -> int | None:
+        selected = self.listbox.curselection()
+        return selected[0] if selected else None
+
+    def selected_group(self) -> dict | None:
+        index = self.selected_index()
+        groups = self._groups()
+        return groups[index] if index is not None and index < len(groups) else None
+
+    def refresh(self, select: int | None = None) -> None:
+        current = self.selected_index() if select is None else select
+        self.listbox.delete(0, "end")
+        groups = self._groups()
+        for group in groups:
+            self.listbox.insert("end", group["name"])
+        if groups:
+            self.listbox.selection_set(min(current or 0, len(groups) - 1))
+        self._on_select()
+
+    def add(self) -> dict | None:
+        name = simpledialog.askstring("グループ追加", "グループ名:", parent=self.winfo_toplevel())
+        if not name or not name.strip():
+            return None
+        group = {"id": str(uuid4()), "name": name.strip(), self._items_key: []}
+        self._groups().append(group)
+        self._on_change()
+        self.refresh(len(self._groups()) - 1)
+        return group
+
+    def rename(self) -> None:
+        group = self.selected_group()
+        if not group:
+            return
+        name = simpledialog.askstring("グループ名変更", "グループ名:", initialvalue=group["name"], parent=self.winfo_toplevel())
+        if name and name.strip():
+            group["name"] = name.strip()
+            self._on_change()
+            self.refresh(self.selected_index())
+
+    def delete(self) -> None:
+        index = self.selected_index()
+        if index is None:
+            return
+        if messagebox.askyesno("グループ削除", f"グループと中の{self._noun}を削除しますか？", parent=self.winfo_toplevel()):
+            del self._groups()[index]
+            self._on_change()
+            self.refresh()
+
+    def move(self, offset: int) -> None:
+        index = self.selected_index()
+        if index is None:
+            return
+        groups = self._groups()
+        target = index + offset
+        if not 0 <= target < len(groups):
+            return
+        groups[index], groups[target] = groups[target], groups[index]
+        self._on_change()
+        self.refresh(target)
 
 
 class ScrollableFrame(ttk.Frame):
