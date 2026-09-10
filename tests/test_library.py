@@ -10,7 +10,7 @@ from PIL import Image
 from shinclipboard.colors import is_hex_color, normalize_hex_color, parse_hex_color, swatch_image
 from shinclipboard.core import ClipboardHistory
 from shinclipboard.storage import JsonStore, library_image_paths
-from shinclipboard.transfer import create_backup, restore_backup
+from shinclipboard.transfer import create_backup, export_settings_package, import_settings_package, restore_backup
 
 
 class ColorParsingTests(unittest.TestCase):
@@ -118,6 +118,84 @@ class LibraryStorageTests(unittest.TestCase):
             restored_config.parent.mkdir()
             restore_backup(backup, restored_config, restored_history)
             self.assertTrue((restored_history.parent / relative).exists())
+
+
+class SettingsPackageTests(unittest.TestCase):
+    """The ZIP that carries definitions, colours, pictures and rules to another machine."""
+
+    def _source(self, base: Path) -> tuple[JsonStore, dict, str]:
+        store = JsonStore(base / "source")
+        config = store.load_config()
+        config["settings"]["screenshot_save_dir"] = r"D:\only-here"
+        config["settings"]["theme"] = "dark"
+        config["groups"][0]["snippets"].append({"id": "s2", "title": "署名", "text": "-- 太郎", "memo": "", "hotkey": "primary+alt+2"})
+        relative, width, height = store.save_library_image(Image.new("RGB", (3, 2), "red"))
+        config["image_groups"] = [{"id": "ig", "name": "ロゴ", "images": [
+            {"id": "i1", "title": "logo", "image_path": relative, "width": width, "height": height, "memo": "", "hotkey": ""},
+        ]}]
+        store.save_config(config)
+        return store, config, relative
+
+    def test_replace_brings_everything_portable_and_leaves_the_machine_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source, config, relative = self._source(base)
+            package = base / "settings.zip"
+            self.assertEqual(export_settings_package(config, source.data_dir, package), 1)
+
+            target = JsonStore(base / "target")
+            local = target.load_config()
+            local["settings"]["screenshot_save_dir"] = r"E:\mine"
+            local["groups"] = [{"id": "old", "name": "消える", "snippets": []}]
+            summary = import_settings_package(local, target.data_dir, package, "replace")
+            self.assertEqual(summary["groups"], 3, "definition, colour and image groups")
+            self.assertEqual([group["name"] for group in local["groups"]], ["サンプル"])
+            self.assertEqual(local["groups"][0]["snippets"][1]["hotkey"], "primary+alt+2")
+            self.assertEqual(local["settings"]["theme"], "dark")
+            self.assertEqual(local["settings"]["screenshot_save_dir"], r"E:\mine", "a folder path is not portable")
+            self.assertTrue(target.image_path(relative).exists(), "the picture travelled with the package")
+            self.assertEqual(local["image_groups"][0]["images"][0]["image_path"], relative)
+
+    def test_merge_adds_what_is_missing_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source, config, relative = self._source(base)
+            package = base / "settings.zip"
+            export_settings_package(config, source.data_dir, package)
+
+            target = JsonStore(base / "target")
+            local = target.load_config()
+            local["settings"]["theme"] = "green"
+            local["groups"][0]["snippets"].append({"id": "mine", "title": "ローカル", "text": "ここだけ", "memo": "", "hotkey": ""})
+            local["color_groups"][0]["colors"][0]["title"] = "ローカルの青"  # same value, different title
+            summary = import_settings_package(local, target.data_dir, package, "merge")
+            self.assertEqual(summary, {"groups": 1, "items": 2, "updated": 1}, "one image group with its picture, one snippet, one renamed colour")
+            sample = local["groups"][0]
+            self.assertEqual([snippet["text"] for snippet in sample["snippets"]], ["お世話になっております。", "ここだけ", "-- 太郎"])
+            self.assertEqual(local["color_groups"][0]["colors"][0]["title"], "ブルー", "same colour: the package's fields win")
+            self.assertEqual(local["settings"]["theme"], "green", "merge leaves the local settings alone")
+            self.assertEqual(local["image_groups"][0]["name"], "ロゴ")
+            self.assertNotEqual(local["image_groups"][0]["id"], "ig", "added groups get fresh ids")
+            self.assertTrue(target.image_path(relative).exists())
+
+            again = import_settings_package(local, target.data_dir, package, "merge")
+            self.assertEqual(again, {"groups": 0, "items": 0, "updated": 0})
+            self.assertEqual(len(sample["snippets"]), 3)
+
+    def test_a_foreign_zip_and_an_unknown_mode_are_rejected(self):
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            store = JsonStore(base / "t")
+            config = store.load_config()
+            bogus = base / "bogus.zip"
+            with zipfile.ZipFile(bogus, "w") as archive:
+                archive.writestr("readme.txt", "hi")
+            with self.assertRaises(ValueError):
+                import_settings_package(config, store.data_dir, bogus, "merge")
+            with self.assertRaises(ValueError):
+                import_settings_package(config, store.data_dir, bogus, "sideways")
 
 
 def _destroy_root(root) -> None:

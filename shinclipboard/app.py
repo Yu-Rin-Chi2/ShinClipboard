@@ -46,7 +46,14 @@ from .platform_support import IS_MAC, UI_FONT_FAMILY
 from .single_instance import SingleInstance
 from .startup import migrate_legacy_startup, set_startup, startup_enabled
 from .storage import JsonStore, default_data_dir, library_image_paths, migrate_legacy_data_dir
-from .transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
+from .transfer import (
+    create_backup,
+    export_settings_package,
+    export_snippets_csv,
+    import_settings_package,
+    import_snippets_csv,
+    restore_backup,
+)
 from .transforms import apply_enabled, apply_transform
 from .widgets import GroupPanel, ImageListbox, ScrollableFrame
 
@@ -557,13 +564,22 @@ class ShinClipboardApp:
         ttk.Button(form, text="設定を保存", command=self._save_settings).grid(row=len(rows) + 1, column=0, sticky="w")
         if IS_MAC:
             self._build_permissions_section()
-        transfer = ttk.LabelFrame(self.settings_tab, text="設定ファイルの移管", padding=12)
+        transfer = ttk.LabelFrame(self.settings_tab, text="他の端末への引き継ぎ", padding=12)
         transfer.pack(fill="x", pady=20)
-        ttk.Label(transfer, text="定型文・グループ・ショートカットを1つのUTF-8 JSONで移管できます。").pack(anchor="w")
+        ttk.Label(
+            transfer,
+            text="定型文・色・画像（ファイル込み）・整形ルール・ショートカットを1つのZIPにまとめて別の端末へ持っていけます。"
+            "取り込むときは「置き換え」か「追加」を選べます。履歴は含みません。",
+        ).pack(anchor="w")
         buttons = ttk.Frame(transfer)
         buttons.pack(fill="x", pady=(10, 0))
-        ttk.Button(buttons, text="設定を書き出す", command=self._export_config).pack(side="left")
-        ttk.Button(buttons, text="設定を読み込む", command=self._import_config).pack(side="left", padx=8)
+        ttk.Button(buttons, text="引き継ぎパッケージを書き出す", command=self._export_package).pack(side="left")
+        ttk.Button(buttons, text="引き継ぎパッケージを取り込む", command=self._import_package).pack(side="left", padx=8)
+        ttk.Label(transfer, text="設定だけをJSONで移すこともできます（画像ファイルは含みません）。", style="Muted.TLabel").pack(anchor="w", pady=(12, 0))
+        json_buttons = ttk.Frame(transfer)
+        json_buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(json_buttons, text="設定を書き出す", command=self._export_config).pack(side="left")
+        ttk.Button(json_buttons, text="設定を読み込む", command=self._import_config).pack(side="left", padx=8)
         ttk.Label(transfer, text=f"現在: {self.store.config_path}", style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
 
         advanced = ttk.LabelFrame(self.settings_tab, text="動作・表示", padding=12)
@@ -2451,6 +2467,81 @@ class ShinClipboardApp:
             self.hotkeys.start()
         except Exception as error:
             self.status_var.set(f"ショートカットを開始できません: {error}")
+
+    def _export_package(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="引き継ぎパッケージを書き出す",
+            defaultextension=".zip",
+            initialfile="ShinClipboard-settings.zip",
+            filetypes=[("ShinClipboard 引き継ぎパッケージ", "*.zip")],
+        )
+        if not path:
+            return
+        try:
+            pictures = export_settings_package(self.config, self.store.data_dir, Path(path))
+        except OSError as error:
+            messagebox.showerror("引き継ぎパッケージ", str(error))
+            return
+        self.status_var.set(f"引き継ぎパッケージを書き出しました（画像{pictures}件を同梱）: {path}")
+
+    def _import_package(self) -> None:
+        path = filedialog.askopenfilename(
+            title="引き継ぎパッケージを取り込む", filetypes=[("ShinClipboard 引き継ぎパッケージ", "*.zip"), ("すべて", "*.*")]
+        )
+        if not path:
+            return
+        mode = self._ask_import_mode()
+        if mode is None:
+            return
+        # The previous config is kept the way a JSON import keeps it, so a
+        # replace that turns out wrong can be undone by hand.
+        backup = self.store.config_path.with_suffix(".json.bak")
+        try:
+            if self.store.config_path.exists():
+                backup.write_bytes(self.store.config_path.read_bytes())
+            summary = import_settings_package(self.config, self.store.data_dir, Path(path), mode)
+            self.store.save_config(self.config)
+            self.config = self.store.load_config()  # fills in defaults the package may lack
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            messagebox.showerror("引き継ぎパッケージ", str(error))
+            return
+        self._load_settings_fields()
+        self._refresh_all()
+        self._restart_hotkeys()
+        if mode == "replace":
+            self.status_var.set(f"引き継ぎパッケージで置き換えました（以前の設定は {backup.name} に保存済み）")
+        else:
+            self.status_var.set(
+                f"引き継ぎパッケージを追加しました: グループ{summary['groups']}件、項目{summary['items']}件を追加、{summary['updated']}件を更新"
+            )
+
+    def _ask_import_mode(self) -> str | None:
+        """Replace everything, or add what is missing? Neither is a yes/no, so a small dialog asks."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("取り込み方法")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        mode = tk.StringVar(value="merge")
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="パッケージの内容をどのように取り込みますか？").pack(anchor="w", pady=(0, 10))
+        ttk.Radiobutton(
+            body, text="追加する — 今の定型文などは残し、パッケージにしかないものを加える（同名グループは合流）",
+            variable=mode, value="merge",
+        ).pack(anchor="w", pady=2)
+        ttk.Radiobutton(
+            body, text="置き換える — 定型文・色・画像・整形ルール・ショートカットをパッケージの内容にする",
+            variable=mode, value="replace",
+        ).pack(anchor="w", pady=2)
+        ttk.Label(body, text="どちらでも履歴は変わりません。", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        result: list[str] = []
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="取り込む", command=lambda: (result.append(mode.get()), dialog.destroy())).pack(side="right")
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="right", padx=6)
+        dialog.wait_window()
+        return result[0] if result else None
 
     def _export_config(self) -> None:
         path = filedialog.asksaveasfilename(title="設定を書き出す", defaultextension=".json", filetypes=[("JSON", "*.json")])

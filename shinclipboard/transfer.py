@@ -13,6 +13,107 @@ CSV_HEADERS = ["定型文グループ", "定型文", "メモ", "ホットキー"
 # `images/` holds the clipboard history, `library/` the registered image library.
 PICTURE_FOLDERS = ("images", "library")
 
+# What a settings package carries between machines: everything the user set up
+# by hand, and nothing that belongs to one computer. The history stays local,
+# and so does a folder path that may not exist elsewhere.
+PACKAGE_COLLECTIONS = ("groups", "color_groups", "image_groups", "transforms")
+MACHINE_SETTINGS = {"screenshot_save_dir"}
+# Which field says two items are "the same thing" when packages are merged.
+_ITEM_IDENTITY = {"groups": ("snippets", "text"), "color_groups": ("colors", "value"), "image_groups": ("images", "image_path")}
+
+
+def export_settings_package(config: dict[str, Any], data_dir: Path, destination: Path) -> int:
+    """Write the portable settings and the library pictures they refer to. Returns the picture count."""
+    payload = {
+        "schema_version": config.get("schema_version", 1),
+        "settings": {key: value for key, value in config.get("settings", {}).items() if key not in MACHINE_SETTINGS},
+    }
+    for key in PACKAGE_COLLECTIONS:
+        payload[key] = config.get(key, [])
+    pictures = 0
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("config.json", json.dumps(payload, ensure_ascii=False, indent=2))
+        for group in config.get("image_groups", []):
+            for item in group.get("images", []):
+                relative = str(item.get("image_path", ""))
+                source = Path(data_dir) / relative
+                if _is_picture_entry(relative) and relative.startswith("library/") and source.is_file():
+                    archive.write(source, relative)
+                    pictures += 1
+    return pictures
+
+
+def import_settings_package(config: dict[str, Any], data_dir: Path, source: Path, mode: str = "merge") -> dict[str, int]:
+    """Bring a package into `config` in place, extracting its pictures into `data_dir`.
+
+    `replace` swaps the collections and portable settings for the package's;
+    `merge` adds what the package has and the local config lacks, matching
+    groups by name and items by content, so importing twice changes nothing.
+    Returns how many groups and items were added or updated.
+    """
+    if mode not in ("replace", "merge"):
+        raise ValueError(f"不明な取り込み方法です: {mode}")
+    with zipfile.ZipFile(source, "r") as archive:
+        names = set(archive.namelist())
+        if "config.json" not in names:
+            raise ValueError("ShinClipboardの引き継ぎパッケージではありません。")
+        try:
+            package = json.loads(archive.read("config.json").decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("パッケージの設定データが壊れています。") from error
+        if not isinstance(package, dict) or "schema_version" not in package:
+            raise ValueError("パッケージの設定データが壊れています。")
+        if package["schema_version"] != config.get("schema_version", 1):
+            raise ValueError("このパッケージのバージョンには対応していません。")
+        for name in names:
+            if name.startswith("library/") and _is_picture_entry(name):
+                target = Path(data_dir) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(name))
+    if mode == "replace":
+        for key in PACKAGE_COLLECTIONS:
+            config[key] = package.get(key, [])
+        settings = config.setdefault("settings", {})
+        settings.update({key: value for key, value in package.get("settings", {}).items() if key not in MACHINE_SETTINGS})
+        return {"groups": sum(len(package.get(key, [])) for key in PACKAGE_COLLECTIONS if key != "transforms"), "items": 0, "updated": 0}
+    return _merge_package(config, package)
+
+
+def _merge_package(config: dict[str, Any], package: dict[str, Any]) -> dict[str, int]:
+    added_groups = added = updated = 0
+    for key, (items_key, identity) in _ITEM_IDENTITY.items():
+        local_groups = config.setdefault(key, [])
+        by_name = {group.get("name", ""): group for group in local_groups}
+        for group in package.get(key, []):
+            target = by_name.get(group.get("name", ""))
+            if target is None:
+                target = {"id": str(uuid4()), "name": group.get("name", ""), items_key: []}
+                local_groups.append(target)
+                by_name[target["name"]] = target
+                added_groups += 1
+            existing = {str(item.get(identity, "")): item for item in target.setdefault(items_key, [])}
+            for item in group.get(items_key, []):
+                match = existing.get(str(item.get(identity, "")))
+                if match is None:
+                    copy = {**item, "id": str(uuid4())}
+                    target[items_key].append(copy)
+                    existing[str(copy.get(identity, ""))] = copy
+                    added += 1
+                elif any(match.get(field) != item.get(field) for field in item if field != "id"):
+                    match.update({field: value for field, value in item.items() if field != "id"})
+                    updated += 1
+    local_rules = config.setdefault("transforms", [])
+    by_name = {rule.get("name", ""): rule for rule in local_rules}
+    for rule in package.get("transforms", []):
+        match = by_name.get(rule.get("name", ""))
+        if match is None:
+            local_rules.append({**rule, "id": str(uuid4())})
+            added += 1
+        elif any(match.get(field) != rule.get(field) for field in rule if field != "id"):
+            match.update({field: value for field, value in rule.items() if field != "id"})
+            updated += 1
+    return {"groups": added_groups, "items": added, "updated": updated}
+
 
 def export_snippets_csv(config: dict[str, Any], destination: Path) -> None:
     with Path(destination).open("w", encoding="utf-8-sig", newline="") as stream:
