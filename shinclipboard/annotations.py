@@ -3,10 +3,13 @@ from __future__ import annotations
 import platform
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import lru_cache
 from math import atan2, cos, hypot, radians, sin
 from uuid import uuid4
 
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
+
+from .fonts import CATALOG, JAPANESE_PROBE, FontFace, has_glyphs  # noqa: F401 - has_glyphs is re-exported
 
 
 Point = tuple[float, float]
@@ -33,9 +36,20 @@ PALETTE = ("#e02424", "#f59e0b", "#facc15", "#22c55e", "#0ea5e9", "#2563eb", "#a
 
 _FONT_CANDIDATES = {
     "Windows": ("YuGothM.ttc", "meiryo.ttc", "msgothic.ttc", "segoeui.ttf"),
-    "Darwin": ("HiraginoSans-W4.ttc", "ヒラギノ角ゴシック W4.ttc", "AppleGothic.ttf", "Arial Unicode.ttf"),
+    # Full paths on macOS. Pillow resolves a bare name by walking the font
+    # folders and comparing file names, and macOS keeps the Hiragino names in
+    # decomposed form (NFD), so the name as typed here never matched. The lookup
+    # then fell through to AppleGothic, a Korean face with no "ー".
+    "Darwin": (
+        "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    ),
 }
 _FONT_FALLBACK = ("DejaVuSans.ttf", "arial.ttf")
+TEXT_LINE_SPACING = 4  # ImageDraw's default gap between the lines of a text
 
 
 @dataclass
@@ -50,6 +64,7 @@ class Shape:
     filled: bool = False
     text: str = ""
     font_size: int = 24
+    font: str = ""  # a family from the font catalog; empty for the platform's default face
     strength: int = 12
     number: int = 1
 
@@ -119,19 +134,64 @@ class AnnotationHistory:
         return bool(self._redo)
 
 
-def resolve_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Return a font that can draw Japanese, falling back until something loads."""
+def resolve_font(size: int, family: str = "") -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """The font for a text annotation: the chosen family when the catalog has it, else the default.
+
+    The family lookup is not cached: the catalog fills in the background, and a
+    miss recorded before it finished would stick.
+    """
     size = max(6, int(size))
-    names = _FONT_CANDIDATES.get(platform.system(), ()) + _FONT_FALLBACK
-    for name in names:
+    face = CATALOG.face(family) if family else None
+    if face is not None:
+        font = _load_face(face, size)
+        if font is not None:
+            return font
+    return _default_font(size)
+
+
+@lru_cache(maxsize=128)
+def _load_face(face: FontFace, size: int) -> ImageFont.FreeTypeFont | None:
+    try:
+        return face.load(size)
+    except (OSError, ValueError):
+        return None  # the file went away since the scan
+
+
+@lru_cache(maxsize=64)
+def _default_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """A font that can draw Japanese, falling back until something loads.
+
+    Cached per size: every text annotation asks for one on every export, and
+    proving a face has the glyphs means rasterising a few of them.
+    """
+    first_loaded = None
+    for name in _FONT_CANDIDATES.get(platform.system(), ()) + _FONT_FALLBACK:
         try:
-            return ImageFont.truetype(name, size)
+            font = ImageFont.truetype(name, size)
         except (OSError, ValueError):
             continue
+        if has_glyphs(font, JAPANESE_PROBE):
+            return font
+        first_loaded = first_loaded or font
+    if first_loaded is not None:
+        return first_loaded  # Latin only, but still a scalable face
     try:
         return ImageFont.load_default(size)
     except TypeError:  # Pillow < 9.2 has no size argument
         return ImageFont.load_default()
+
+
+def text_line_height(size: int, family: str = "") -> float:
+    """Distance between the lines of a multi-line text annotation, in pixels.
+
+    This is what `ImageDraw.multiline_text` uses with its default spacing, so
+    the preview can lay lines out at the same pitch.
+    """
+    font = resolve_font(size, family)
+    try:
+        return font.getbbox("A")[3] + TEXT_LINE_SPACING
+    except (AttributeError, TypeError):
+        return size * 1.2 + TEXT_LINE_SPACING
 
 
 def effective_blur_radius(strength: int, region: tuple[float, float]) -> int:
@@ -230,7 +290,9 @@ def _draw_vectors(image: Image.Image, document: AnnotationDocument) -> None:
                 draw.line(shape.points, fill=_rgb(shape.color), width=max(1, shape.width), joint="curve")
         elif shape.kind == "text":
             if shape.text:
-                draw.text(shape.points[0], shape.text, font=resolve_font(shape.font_size), fill=_rgb(shape.color))
+                draw.text(
+                    shape.points[0], shape.text, font=resolve_font(shape.font_size, shape.font), fill=_rgb(shape.color)
+                )
         elif shape.kind == "number":
             _draw_number(draw, shape)
 

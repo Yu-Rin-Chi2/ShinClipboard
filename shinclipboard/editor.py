@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
@@ -19,9 +20,12 @@ from .annotations import (
     hit_test,
     render,
     render_raster,
+    resolve_font,
+    text_line_height,
 )
+from .fonts import CATALOG
 from .icons import tool_icon
-from .platform_support import UI_FONT_FAMILY
+from .platform_support import IS_MAC, UI_FONT_FAMILY
 
 
 # Tool id -> (button label, tooltip-ish hint shown in the status bar).
@@ -48,7 +52,14 @@ EXPORT_DIR = "exports"
 EXPORT_MAX_AGE = 24 * 60 * 60
 TOOL_SELECTED_BG = "#bfdbfe"
 SWATCH_SIZE = 20  # pixels per colour swatch, selection ring not included
-TEXTBOX_HINT = "Ctrl+Enter: 確定   Esc: 取りやめ   Enter: 改行"
+# The Text widget's own bindings speak Command on macOS, so the shortcuts
+# offered next to them do too.
+PRIMARY_KEY = "Cmd" if IS_MAC else "Ctrl"
+TEXTBOX_HINT = f"{PRIMARY_KEY}+Enter: 確定   Esc: 取りやめ   Enter: 改行"
+TEXTBOX_BORDER = 1  # borderwidth and highlightthickness of the inline text box
+TEXTBOX_PADX = 2
+DEFAULT_FONT_LABEL = "（標準）"  # the font menu's entry for "no family chosen"
+FONT_MENU_POLL_MS = 500  # how often the menu looks for the background font scan to finish
 
 
 class _Tooltip:
@@ -113,9 +124,11 @@ class ImageEditorWindow:
     truth; the canvas is only a draft.
     """
 
-    def __init__(self, app, base: Image.Image, title: str = "画像編集"):
+    def __init__(self, app, base: Image.Image, title: str = "画像編集", from_screenshot: bool = False):
         self.app = app
         self.base = base.convert("RGBA")
+        # A screenshot's editor is replaced by the next shot's; the others stay.
+        self.from_screenshot = from_screenshot
         self.document = AnnotationDocument()
         self.history = AnnotationHistory()
         self.selected_id: str | None = None
@@ -131,6 +144,7 @@ class ImageEditorWindow:
         self.color_var = tk.StringVar(value=str(settings.get("annotation_color", PALETTE[0])))
         self.width_var = tk.StringVar(value=str(settings.get("annotation_width", 4)))
         self.font_size_var = tk.StringVar(value="24")
+        self.font_var = tk.StringVar(value=font_label(str(settings.get("annotation_font", ""))))
         self.filled_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="ドラッグで矢印を引きます")
 
@@ -150,11 +164,22 @@ class ImageEditorWindow:
         self._text_box_item: int | None = None
         self._text_box_origin: tuple[float, float] = (0.0, 0.0)
         self._text_box_shape_id: str | None = None  # set when re-editing an existing text
+        self._text_box_size = 24  # what the box shows; the toolbar feeds it while it is open
+        self._text_box_color = self.color_var.get()
+        self._text_box_font = ""
+        self._font_family = preview_font_family(self.window)
+        self._tk_families: dict[str, bool] = {}  # catalog family -> whether Tk knows it too
+        self._tk_fonts: dict[tuple[str, int], tkfont.Font] = {}  # by family and pixel size, for metrics
+        self._font_menu_job: str | None = None
+        self.font_size_var.trace_add("write", self._sync_text_box_style)
+        self.color_var.trace_add("write", self._sync_text_box_style)
+        self.font_var.trace_add("write", self._sync_text_box_style)
 
         self._build_toolbar()
         self._build_canvas()
         self._build_actions()
         self._bind_keys()
+        self._watch_font_catalog()
         # The canvas reports 1x1 until the window manager has laid it out, so the
         # first fit has to wait for a real <Configure> rather than the idle loop.
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -212,6 +237,15 @@ class ImageEditorWindow:
         ttk.Spinbox(options, from_=1, to=40, width=4, textvariable=self.width_var).pack(side="left", padx=(4, 12))
         ttk.Label(options, text="文字サイズ").pack(side="left")
         ttk.Spinbox(options, from_=8, to=200, width=4, textvariable=self.font_size_var).pack(side="left", padx=(4, 12))
+        ttk.Label(options, text="フォント").pack(side="left")
+        # The list is filled when the menu opens: the catalog behind it is
+        # scanned in the background and may still be on its way.
+        self.font_combo = ttk.Combobox(
+            options, textvariable=self.font_var, state="readonly", width=22, postcommand=self._fill_font_menu
+        )
+        self.font_combo.pack(side="left", padx=(4, 12))
+        self.font_combo.bind("<<ComboboxSelected>>", self._font_chosen)
+        self._fill_font_menu()
         ttk.Checkbutton(options, text="塗りつぶし", variable=self.filled_var).pack(side="left")
 
         # What is drawn goes above, what is done to the picture goes here. One
@@ -248,6 +282,8 @@ class ImageEditorWindow:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
+        if IS_MAC:
+            self.canvas.bind("<Command-MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<MouseWheel>", lambda event: self.canvas.yview_scroll(-int(event.delta / 120), "units"))
 
     def _build_actions(self) -> None:
@@ -265,18 +301,24 @@ class ImageEditorWindow:
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
 
     def _bind_keys(self) -> None:
-        self.window.bind("<Control-z>", lambda _: self.undo())
-        self.window.bind("<Control-y>", lambda _: self.redo())
-        self.window.bind("<Control-Shift-Z>", lambda _: self.redo())
-        self.window.bind("<Control-c>", lambda _: self.copy_to_clipboard())
-        self.window.bind("<Control-s>", lambda _: self.save_as())
+        self._bind_shortcut("z", lambda _: self.undo())
+        self._bind_shortcut("y", lambda _: self.redo())
+        self._bind_shortcut("Shift-Z", lambda _: self.redo())
+        self._bind_shortcut("c", self._on_copy_key)
+        self._bind_shortcut("s", lambda _: self.save_as())
         self.window.bind("<Delete>", lambda _: self.delete_selected())
         self.window.bind("<BackSpace>", lambda _: self.delete_selected())
         self.window.bind("<Escape>", self._on_escape)
-        self.window.bind("<Control-Key-0>", lambda _: self._zoom_to_fit())
-        self.window.bind("<Control-Key-1>", lambda _: self.set_zoom(1.0))
-        self.window.bind("<Control-plus>", lambda _: self.zoom_by(1.25))
-        self.window.bind("<Control-minus>", lambda _: self.zoom_by(1 / 1.25))
+        self._bind_shortcut("Key-0", lambda _: self._zoom_to_fit())
+        self._bind_shortcut("Key-1", lambda _: self.set_zoom(1.0))
+        self._bind_shortcut("plus", lambda _: self.zoom_by(1.25))
+        self._bind_shortcut("minus", lambda _: self.zoom_by(1 / 1.25))
+
+    def _bind_shortcut(self, key: str, handler) -> None:
+        """Bind Ctrl+key, and on macOS Cmd+key as well: Tk keeps the two apart there."""
+        self.window.bind(f"<Control-{key}>", handler)
+        if IS_MAC:
+            self.window.bind(f"<Command-{key}>", handler)
 
     # ----- coordinate helpers -----------------------------------------------------
 
@@ -367,8 +409,8 @@ class ImageEditorWindow:
             if shape.id != self._text_box_shape_id:  # the box stands in for it while editing
                 self._draw_shape(shape)
         self._paint_selection()
-        if self._text_box_item is not None:
-            self.canvas.coords(self._text_box_item, *self._to_canvas(*self._text_box_origin))
+        if self._text_box is not None:
+            self._sync_text_box_style()
             self.canvas.tag_raise("textbox")
 
     def _draw_shape(self, shape: Shape) -> None:
@@ -398,10 +440,15 @@ class ImageEditorWindow:
             # smooth them or the stroke would shift when it is exported.
             self.canvas.create_line(*flat, fill=shape.color, width=width, smooth=False, tags=tags)
         elif shape.kind == "text":
-            self.canvas.create_text(
-                *points[0], text=shape.text, fill=shape.color, anchor="nw",
-                font=self._font(shape.font_size), tags=tags,
-            )
+            # One item per line: a canvas item spaces lines by Tk's line height,
+            # which for CJK faces is far looser than the pitch PIL exports at.
+            x, y = shape.points[0]
+            pitch = text_line_height(shape.font_size, shape.font)
+            for index, line in enumerate(shape.text.split("\n")):
+                self.canvas.create_text(
+                    *self._text_top(x, y + index * pitch, shape.font_size, shape.font), text=line,
+                    fill=shape.color, anchor="nw", font=self._font(shape.font_size, shape.font), tags=tags,
+                )
         elif shape.kind == "number":
             radius = badge_radius(shape) * self.zoom
             x, y = points[0]
@@ -412,14 +459,48 @@ class ImageEditorWindow:
                 x, y, text=str(shape.number), fill="#ffffff", font=self._font(shape.font_size), tags=tags
             )
 
-    def _font(self, size: int) -> tuple[str, int]:
+    def _font(self, size: int, family: str = "") -> tuple[str, int]:
         """A canvas font measured in pixels, the unit PIL uses.
 
         Tk reads a positive size as points and scales it by the screen DPI, which
         makes canvas text noticeably larger than the exported text; a negative
         size means pixels and matches `annotations.resolve_font`.
         """
-        return (UI_FONT_FAMILY, -max(1, int(round(size * self.zoom))))
+        return (self._tk_family(family), -self._pixels(size))
+
+    def _tk_family(self, family: str) -> str:
+        """The Tk family for a catalog family, or the default face when Tk does not know it."""
+        if not family:
+            return self._font_family
+        known = self._tk_families.get(family)
+        if known is None:
+            known = self._tk_families[family] = tk_knows_family(self.window, family)
+        return family if known else self._font_family
+
+    def _pixels(self, size: int) -> int:
+        return max(1, int(round(size * self.zoom)))
+
+    def _tk_font(self, pixels: int, family: str = "") -> tkfont.Font:
+        """The canvas font as an object, for measuring. Cached: Tk keeps each one alive."""
+        key = (family, pixels)
+        font = self._tk_fonts.get(key)
+        if font is None:
+            font = self._tk_fonts[key] = tkfont.Font(self.window, font=(self._tk_family(family), -pixels))
+        return font
+
+    def _text_top(self, x: float, y: float, size: int, family: str = "") -> tuple[float, float]:
+        """Where a canvas text item goes so its glyphs land where PIL draws them.
+
+        PIL puts the ascender line at the requested point, whereas a canvas item's
+        top is that of its line box, which CJK faces pad well above the ascender:
+        drawn at the same point the preview sits visibly lower than the export.
+        """
+        pixels = self._pixels(size)
+        pil_font = resolve_font(pixels, family)
+        pil_ascent = pil_font.getmetrics()[0] if hasattr(pil_font, "getmetrics") else None
+        tk_ascent = self._tk_font(pixels, family).metrics("ascent")
+        canvas_x, canvas_y = self._to_canvas(x, y)
+        return (canvas_x, canvas_y - (tk_ascent - pil_ascent if pil_ascent is not None else 0))
 
     def _paint_selection(self) -> None:
         self.canvas.delete("handle")
@@ -575,51 +656,88 @@ class ImageEditorWindow:
     def _open_text_box(self, x: float, y: float, shape: Shape | None = None) -> None:
         """Drop a real Text widget onto the canvas so typing (and the IME) works in place."""
         self._commit_text_box()
-        font_size = shape.font_size if shape else self._int(self.font_size_var, 24, 8, 200)
-        color = shape.color if shape else self.color_var.get()
+        if shape is not None:
+            # The toolbar shows the text being edited, so that nudging the size
+            # or picking a colour changes this text instead of jumping it to
+            # whatever the previous shape was drawn with.
+            self.font_size_var.set(str(shape.font_size))
+            self.font_var.set(font_label(shape.font))
+            self.color_var.set(shape.color)
+            self._paint_swatches()
+        self._text_box_size = self._int(self.font_size_var, 24, 8, 200)
+        self._text_box_color = self.color_var.get()
+        self._text_box_font = self._chosen_font()
         box = tk.Text(
             self.canvas,
             width=12,
             height=1,
             wrap="none",
-            font=self._font(font_size),
-            foreground=color,
-            insertbackground=color,
+            font=self._font(self._text_box_size, self._text_box_font),
+            foreground=self._text_box_color,
+            insertbackground=self._text_box_color,
             background="#ffffff",
             relief="solid",
-            borderwidth=1,
-            highlightthickness=1,
+            borderwidth=TEXTBOX_BORDER,
+            highlightthickness=TEXTBOX_BORDER,
             highlightcolor="#0ea5e9",
-            padx=2,
+            padx=TEXTBOX_PADX,
             pady=0,
             undo=True,
         )
         if shape is not None:
             box.insert("1.0", shape.text)
         box.bind("<Control-Return>", lambda _: self._commit_text_box() or "break")
+        if IS_MAC:
+            box.bind("<Command-Return>", lambda _: self._commit_text_box() or "break")
         box.bind("<Escape>", lambda _: self._cancel_text_box() or "break")
         box.bind("<KeyRelease>", lambda _: self._grow_text_box())
         self._text_box = box
         self._text_box_origin = (x, y)
         self._text_box_shape_id = shape.id if shape else None
         self._text_box_item = self.canvas.create_window(
-            *self._to_canvas(x, y), window=box, anchor="nw", tags="textbox"
+            *self._text_box_position(), window=box, anchor="nw", tags="textbox"
         )
         self.selected_id = None
         self.refresh()
-        self._grow_text_box()
         box.focus_set()
         self._set_status(TEXTBOX_HINT)
+
+    def _text_box_position(self) -> tuple[float, float]:
+        """Place the box so the glyphs inside it sit exactly where the text will be drawn."""
+        x, y = self._text_top(*self._text_box_origin, self._text_box_size, self._text_box_font)
+        return (x - TEXTBOX_PADX - 2 * TEXTBOX_BORDER, y - 2 * TEXTBOX_BORDER)
+
+    def _sync_text_box_style(self, *_args) -> None:
+        """Feed the toolbar's size and colour into the open box, and re-place it for the zoom."""
+        box = self._text_box
+        if box is None:
+            return
+        try:
+            self._text_box_size = max(8, min(200, int(self.font_size_var.get())))
+        except (TypeError, ValueError):
+            pass  # half-typed in the spinbox; keep the last good size
+        self._text_box_color = self.color_var.get()
+        self._text_box_font = self._chosen_font()
+        box.configure(
+            font=self._font(self._text_box_size, self._text_box_font),
+            foreground=self._text_box_color,
+            insertbackground=self._text_box_color,
+        )
+        if self._text_box_item is not None:
+            self.canvas.coords(self._text_box_item, *self._text_box_position())
+        self._grow_text_box()
 
     def _grow_text_box(self) -> None:
         box = self._text_box
         if box is None:
             return
         lines = box.get("1.0", "end-1c").split("\n")
-        box.configure(
-            width=max(12, max(len(line) for line in lines) + 2),
-            height=max(1, len(lines)),
-        )
+        # Text sizes itself in "0"s, of which a kana or kanji is about two wide,
+        # so the width is measured rather than counted.
+        font = self._tk_font(self._pixels(self._text_box_size), self._text_box_font)
+        zero = max(1, font.measure("0"))
+        widest = max(font.measure(line) for line in lines)
+        box.configure(width=max(12, -(-widest // zero) + 2), height=max(1, len(lines)))
 
     def _commit_text_box(self) -> None:
         box, self._text_box = self._text_box, None
@@ -636,12 +754,13 @@ class ImageEditorWindow:
             self.refresh()
             return
         self.history.push(self.document)
-        if existing is not None:
-            existing.text = text
-        else:
-            shape = self._new_shape("text", [self._text_box_origin])
-            shape.text = text
-            self.document.shapes.append(shape)
+        if existing is None:
+            existing = self._new_shape("text", [self._text_box_origin])
+            self.document.shapes.append(existing)
+        existing.text = text
+        existing.font_size = self._text_box_size
+        existing.font = self._text_box_font
+        existing.color = self._text_box_color
         self.refresh()
         self.window.focus_set()
 
@@ -673,6 +792,7 @@ class ImageEditorWindow:
             width=self._int(self.width_var, 4, 1, 40),
             filled=self.filled_var.get(),
             font_size=self._int(self.font_size_var, 24, 8, 200),
+            font=self._chosen_font(),
             strength=max(effective_pixel_block(0), self._int(self.width_var, 4, 1, 40) * 3),
         )
 
@@ -697,6 +817,36 @@ class ImageEditorWindow:
             shape.color = color
             self.refresh(rebuild_raster=shape.kind in RASTER_KINDS)
 
+    def _chosen_font(self) -> str:
+        return font_family(self.font_var.get())
+
+    def _fill_font_menu(self) -> None:
+        self.font_combo["values"] = [DEFAULT_FONT_LABEL, *CATALOG.families()]
+
+    def _watch_font_catalog(self) -> None:
+        """Fill the menu as soon as the background scan is done, so the first click sees it."""
+        self._font_menu_job = None
+        if CATALOG.ready:
+            self._fill_font_menu()
+            return
+        self._font_menu_job = self.window.after(FONT_MENU_POLL_MS, self._watch_font_catalog)
+
+    def _font_chosen(self, _event=None) -> None:
+        """A pick from the menu is remembered as the default and applied to a selected text."""
+        family = self._chosen_font()
+        settings = self.app.config["settings"]
+        if settings.get("annotation_font", "") != family:
+            settings["annotation_font"] = family
+            try:
+                self.app.store.save_config(self.app.config)
+            except OSError:
+                pass  # still applies for this session
+        shape = self.document.find(self.selected_id) if self.selected_id else None
+        if shape is not None and shape.kind == "text":
+            self.history.push(self.document)
+            shape.font = family
+            self.refresh()
+
     def _choose_color(self) -> None:
         chosen = colorchooser.askcolor(color=self.color_var.get(), parent=self.window)[1]
         if chosen:
@@ -719,6 +869,8 @@ class ImageEditorWindow:
         return "break"
 
     def redo(self) -> str:
+        if self._text_box is not None:
+            return "break"
         restored = self.history.redo(self.document)
         if restored is not None:
             self.document = restored
@@ -762,6 +914,12 @@ class ImageEditorWindow:
 
     def close(self) -> None:
         self.app.editors.discard(self)
+        if self._font_menu_job is not None:
+            try:
+                self.window.after_cancel(self._font_menu_job)
+            except tk.TclError:
+                pass
+            self._font_menu_job = None
         self.window.destroy()
 
     # ----- output -----------------------------------------------------------------
@@ -772,6 +930,11 @@ class ImageEditorWindow:
 
     def _write_export(self) -> Path:
         return write_export(self.app.store.data_dir, self.result())
+
+    def _on_copy_key(self, _event=None) -> str | None:
+        if self._text_box is not None:
+            return None  # the Text widget has already copied its selection
+        return self.copy_to_clipboard()
 
     def copy_to_clipboard(self) -> str:
         try:
@@ -852,6 +1015,36 @@ class ImageEditorWindow:
             return max(low, min(high, int(variable.get())))
         except (TypeError, ValueError):
             return fallback
+
+
+def font_label(family: str) -> str:
+    """What the font menu shows for a catalog family."""
+    return family or DEFAULT_FONT_LABEL
+
+
+def font_family(label: str) -> str:
+    """The catalog family behind a menu entry; empty for the default face."""
+    return "" if label in ("", DEFAULT_FONT_LABEL) else label
+
+
+def tk_knows_family(master: tk.Misc, family: str) -> bool:
+    """Whether Tk can draw with this family: it silently substitutes a default for a
+    name it does not know, and `actual()` reports the substitute."""
+    try:
+        return str(tkfont.Font(master, font=(family, -24)).actual("family")).lower() == family.lower()
+    except tk.TclError:
+        return False
+
+
+def preview_font_family(master: tk.Misc) -> str:
+    """The Tk family of the face the export is drawn with by default.
+
+    The canvas is only a draft, but a draft in the UI font shows other glyphs
+    (and on macOS smaller kana) than the picture that is copied.
+    """
+    font = resolve_font(24)
+    family = font.getname()[0] if hasattr(font, "getname") else ""
+    return family if family and tk_knows_family(master, family) else UI_FONT_FAMILY
 
 
 def _pictures_dir() -> Path:

@@ -39,7 +39,12 @@ def main():
                         except OSError:
                             pass
                     windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-                    if signalled and any(w.get("kCGWindowOwnerPID") == process.pid and w.get("kCGWindowLayer") == 0 for w in windows):
+                    # The popup is shown topmost, which puts it on a floating
+                    # layer rather than layer 0, so it is recognised by its title.
+                    if signalled and any(
+                        w.get("kCGWindowOwnerPID") == process.pid and str(w.get("kCGWindowName", "")).startswith("ShinClipboard")
+                        for w in windows
+                    ):
                         print("PASS: app initialized, accepted show request, and displayed a window")
                         return
                     time.sleep(0.2)

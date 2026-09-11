@@ -23,6 +23,7 @@ from .clipboard_images import clipboard_change_token, read_clipboard_image, writ
 from .colors import normalize_hex_color, parse_hex_color, swatch_image
 from .core import FifoQueue, HistoryItem
 from .editor import ImageEditorWindow, cleanup_exports, write_export
+from .fonts import CATALOG as FONT_CATALOG
 from .hotkeys import GlobalHotkeyService
 from .macos import (
     ACCESSIBILITY_HINT,
@@ -55,7 +56,7 @@ from .transfer import (
     restore_backup,
 )
 from .transforms import apply_enabled, apply_transform
-from .widgets import GroupPanel, ImageListbox, ScrollableFrame
+from .widgets import GROUP_LIST_WIDTH, FlowBar, GroupPanel, ImageListbox, ScrollableFrame, fit_tree_columns
 
 
 THEMES = {
@@ -63,6 +64,17 @@ THEMES = {
     "dark": {"background": "#1f2937", "stripe": "#354154", "accent": "#0284c7", "foreground": "#f8fafc"},
     "green": {"background": "#ffffff", "stripe": "#e1eee8", "accent": "#047857", "foreground": "#15332b"},
 }
+# Follows the OS: the dark palette while macOS is in dark mode, blue otherwise.
+# Elsewhere it is simply blue, since Tk cannot tell there.
+SYSTEM_THEME = "system"
+THEME_NAMES = (SYSTEM_THEME, *THEMES)
+
+
+def theme_colors(name: str, dark: bool) -> dict[str, str]:
+    """The palette for a theme setting, resolving "system" by the OS appearance."""
+    if name == SYSTEM_THEME:
+        name = "dark" if dark else "blue"
+    return THEMES.get(name, THEMES["blue"])
 
 
 def resource_path(relative: str) -> Path:
@@ -206,7 +218,9 @@ class ShinClipboardApp:
 
     def _configure_window(self) -> None:
         self.root.title("ShinClipboard - 設定・編集")
-        self.root.geometry("920x720")
+        # macOS draws buttons and labels a third wider, so the same rows need a
+        # wider window to sit on one line.
+        self.root.geometry("1000x720" if IS_MAC else "920x720")
         self.root.minsize(720, 500)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         icon_png = resource_path("assets/shinclipboard-512.png")
@@ -218,6 +232,13 @@ class ShinClipboardApp:
             style.theme_use("vista")
         style.configure("Title.TLabel", font=(UI_FONT_FAMILY, 15, "bold"))
         style.configure("Muted.TLabel", foreground="#5f6b7a")
+        if IS_MAC:
+            # Aqua sets the tab titles almost edge to edge in their segments.
+            style.configure("TNotebook.Tab", padding=(22, 5))
+            # Tk announces a switch of the system appearance with these; the
+            # "system" theme repaints the lists to match.
+            self.root.bind("<<DarkAqua>>", self._appearance_changed, add="+")
+            self.root.bind("<<LightAqua>>", self._appearance_changed, add="+")
 
     def _build_ui(self) -> None:
         header = ttk.Frame(self.root, padding=(16, 14, 16, 6))
@@ -225,6 +246,23 @@ class ShinClipboardApp:
         ttk.Label(header, text="ShinClipboard", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="クリップボード履歴と定型文", style="Muted.TLabel").pack(side="left", padx=14)
         ttk.Button(header, text="隠す", command=self.hide_window).pack(side="right")
+
+        # Some of what goes here is a sentence of guidance rather than a word of
+        # state, and a single line drops its end - the half that says what to do.
+        # Packed before the notebook: pack gives way from the last slave in, and
+        # when the tabs ask for more height than the window has it is the
+        # notebook that should lose a few rows, not the status line that should
+        # vanish.
+        # The sunken bevel is drawn in light and dark lines; on a dark macOS
+        # window the light ones read as a white frame around the bar.
+        status = ttk.Label(
+            self.root, textvariable=self.status_var, relief="flat" if IS_MAC else "sunken",
+            anchor="w", justify="left", padding=(8, 4),
+        )
+        status.pack(side="bottom", fill="x")
+        if IS_MAC:
+            ttk.Separator(self.root, orient="horizontal").pack(side="bottom", fill="x")
+        status.bind("<Configure>", self._wrap_status)
 
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill="both", expand=True, padx=14, pady=8)
@@ -253,13 +291,6 @@ class ShinClipboardApp:
         self._build_fifo_tab()
         self._build_transform_tab()
         self._build_settings_tab()
-        # Some of what goes here is a sentence of guidance rather than a word of
-        # state, and a single line drops its end - the half that says what to do.
-        status = ttk.Label(
-            self.root, textvariable=self.status_var, relief="sunken", anchor="w", justify="left", padding=(8, 4)
-        )
-        status.pack(fill="x")
-        status.bind("<Configure>", self._wrap_status)
 
     def _wrap_status(self, event) -> None:
         """Follow the window's width, ignoring the resize wrapping itself causes."""
@@ -374,15 +405,15 @@ class ShinClipboardApp:
         self.history_list.pack(fill="both", expand=True)
         self.history_list.bind("<Button-3>", self._history_right_click)
         self.history_list.bind("<Return>", lambda _: self._paste_selected_history())
-        bar = ttk.Frame(self.history_tab)
+        bar = FlowBar(self.history_tab)
         bar.pack(fill="x", pady=(8, 0))
-        ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_history).pack(side="left")
-        ttk.Button(bar, text="貼り付け", command=self._paste_selected_history).pack(side="left", padx=6)
-        ttk.Button(bar, text="編集", command=self._edit_history).pack(side="left")
-        ttk.Button(bar, text="画像を編集", command=self._edit_selected_history_image).pack(side="left", padx=6)
-        ttk.Button(bar, text="改行ごとに展開", command=self._split_history_lines).pack(side="left", padx=6)
-        ttk.Button(bar, text="選択を連結", command=self._join_history).pack(side="left")
-        ttk.Label(bar, text="右クリックで色・画像を登録できます", style="Muted.TLabel").pack(side="right")
+        bar.add(ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_history))
+        bar.add(ttk.Button(bar, text="貼り付け", command=self._paste_selected_history))
+        bar.add(ttk.Button(bar, text="編集", command=self._edit_history))
+        bar.add(ttk.Button(bar, text="画像を編集", command=self._edit_selected_history_image))
+        bar.add(ttk.Button(bar, text="改行ごとに展開", command=self._split_history_lines))
+        bar.add(ttk.Button(bar, text="選択を連結", command=self._join_history))
+        bar.add(ttk.Label(bar, text="右クリックで色・画像を登録できます", style="Muted.TLabel"), right=True, wrap=True)
 
     def _build_color_tab(self) -> None:
         outer = ttk.Panedwindow(self.color_tab, orient="horizontal")
@@ -399,7 +430,7 @@ class ShinClipboardApp:
         right = ttk.Frame(outer)
         outer.add(self.color_groups, weight=1)
         outer.add(right, weight=3)
-        ttk.Label(right, text="値は #RRGGBB / #RRGGBBAA で登録し、登録した表記のまま貼り付けます。", style="Muted.TLabel").pack(anchor="w")
+        self._hint(right, "値は #RRGGBB / #RRGGBBAA で登録し、登録した表記のまま貼り付けます。")
         self.color_tree = ttk.Treeview(right, columns=("title", "value", "memo", "hotkey"), show="tree headings")
         self.color_tree.column("#0", width=48, stretch=False)
         # Column widths are what the table asks the window for, so they are kept
@@ -408,6 +439,7 @@ class ShinClipboardApp:
             self.color_tree.heading(key, text=label)
             self.color_tree.column(key, width=width)
         self.color_tree.pack(fill="both", expand=True, pady=6)
+        fit_tree_columns(self.color_tree)
         self.color_tree.bind(
             "<Button-3>",
             lambda event: self._library_menu(
@@ -416,15 +448,15 @@ class ShinClipboardApp:
         )
         self.color_tree.bind("<Return>", lambda _: self._paste_selected_color())
         self.color_tree.bind("<Delete>", lambda _: self._delete_color())
-        bar = ttk.Frame(right)
+        bar = FlowBar(right)
         bar.pack(fill="x")
-        ttk.Button(bar, text="追加", command=self._add_color).pack(side="left")
-        ttk.Button(bar, text="編集", command=self._edit_color).pack(side="left", padx=4)
-        ttk.Button(bar, text="削除", command=self._delete_color).pack(side="left")
-        ttk.Button(bar, text="↑", width=3, command=lambda: self._move_color(-1)).pack(side="left", padx=(8, 2))
-        ttk.Button(bar, text="↓", width=3, command=lambda: self._move_color(1)).pack(side="left")
-        ttk.Button(bar, text="貼り付け", command=self._paste_selected_color).pack(side="right")
-        ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_color).pack(side="right", padx=6)
+        bar.add(ttk.Button(bar, text="追加", command=self._add_color))
+        bar.add(ttk.Button(bar, text="編集", command=self._edit_color))
+        bar.add(ttk.Button(bar, text="削除", command=self._delete_color))
+        bar.add(ttk.Button(bar, text="↑", width=3, command=lambda: self._move_color(-1)), gap=4)
+        bar.add(ttk.Button(bar, text="↓", width=3, command=lambda: self._move_color(1)), together=True)
+        bar.add(ttk.Button(bar, text="貼り付け", command=self._paste_selected_color), right=True)
+        bar.add(ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_color), right=True)
 
     def _build_image_tab(self) -> None:
         outer = ttk.Panedwindow(self.image_tab, orient="horizontal")
@@ -441,11 +473,7 @@ class ShinClipboardApp:
         right = ttk.Frame(outer)
         outer.add(self.image_groups, weight=1)
         outer.add(right, weight=3)
-        ttk.Label(
-            right,
-            text="ファイル、クリップボード、履歴（右クリック）から登録できます。画像ファイルをこの表へドロップしても登録できます。",
-            style="Muted.TLabel",
-        ).pack(anchor="w")
+        self._hint(right, "ファイル、クリップボード、履歴（右クリック）から登録できます。画像ファイルをこの表へドロップしても登録できます。")
         # Thumbnails need taller rows than the other tables; the style inherits
         # the font from "Treeview" and only overrides the height.
         ttk.Style().configure("Library.Treeview", rowheight=TREE_THUMBNAIL_ROW)
@@ -460,6 +488,7 @@ class ShinClipboardApp:
             self.image_tree.heading(key, text=label)
             self.image_tree.column(key, width=width)
         self.image_tree.pack(fill="both", expand=True, pady=6)
+        fit_tree_columns(self.image_tree)
         self.image_tree.bind(
             "<Button-3>",
             lambda event: self._library_menu(
@@ -468,15 +497,15 @@ class ShinClipboardApp:
         )
         self.image_tree.bind("<Return>", lambda _: self._paste_selected_image())
         self.image_tree.bind("<Delete>", lambda _: self._delete_image())
-        bar = ttk.Frame(right)
+        bar = FlowBar(right)
         bar.pack(fill="x")
-        ttk.Button(bar, text="追加", command=self._add_image).pack(side="left")
-        ttk.Button(bar, text="編集", command=self._edit_image).pack(side="left", padx=4)
-        ttk.Button(bar, text="削除", command=self._delete_image).pack(side="left")
-        ttk.Button(bar, text="↑", width=3, command=lambda: self._move_image(-1)).pack(side="left", padx=(8, 2))
-        ttk.Button(bar, text="↓", width=3, command=lambda: self._move_image(1)).pack(side="left")
-        ttk.Button(bar, text="貼り付け", command=self._paste_selected_image).pack(side="right")
-        ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_image).pack(side="right", padx=6)
+        bar.add(ttk.Button(bar, text="追加", command=self._add_image))
+        bar.add(ttk.Button(bar, text="編集", command=self._edit_image))
+        bar.add(ttk.Button(bar, text="削除", command=self._delete_image))
+        bar.add(ttk.Button(bar, text="↑", width=3, command=lambda: self._move_image(-1)), gap=4)
+        bar.add(ttk.Button(bar, text="↓", width=3, command=lambda: self._move_image(1)), together=True)
+        bar.add(ttk.Button(bar, text="貼り付け", command=self._paste_selected_image), right=True)
+        bar.add(ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_image), right=True)
 
     def _build_snippet_tab(self) -> None:
         outer = ttk.Panedwindow(self.snippet_tab, orient="horizontal")
@@ -486,16 +515,16 @@ class ShinClipboardApp:
         outer.add(left, weight=1)
         outer.add(right, weight=3)
         ttk.Label(left, text="グループ").pack(anchor="w")
-        self.group_list = tk.Listbox(left, exportselection=False, font=(UI_FONT_FAMILY, 10))
+        self.group_list = tk.Listbox(left, exportselection=False, font=(UI_FONT_FAMILY, 10), width=GROUP_LIST_WIDTH)
         self.group_list.pack(fill="both", expand=True, pady=6)
         self.group_list.bind("<<ListboxSelect>>", lambda _: self._refresh_snippets())
-        group_bar = ttk.Frame(left)
+        group_bar = FlowBar(left)
         group_bar.pack(fill="x")
-        ttk.Button(group_bar, text="追加", command=self._add_group).pack(side="left")
-        ttk.Button(group_bar, text="名前変更", command=self._rename_group).pack(side="left", padx=4)
-        ttk.Button(group_bar, text="削除", command=self._delete_group).pack(side="left", padx=4)
-        ttk.Button(group_bar, text="↑", width=3, command=lambda: self._move_group(-1)).pack(side="left")
-        ttk.Button(group_bar, text="↓", width=3, command=lambda: self._move_group(1)).pack(side="left", padx=2)
+        group_bar.add(ttk.Button(group_bar, text="追加", command=self._add_group))
+        group_bar.add(ttk.Button(group_bar, text="名前変更", command=self._rename_group))
+        group_bar.add(ttk.Button(group_bar, text="削除", command=self._delete_group))
+        group_bar.add(ttk.Button(group_bar, text="↑", width=3, command=lambda: self._move_group(-1)), gap=4)
+        group_bar.add(ttk.Button(group_bar, text="↓", width=3, command=lambda: self._move_group(1)), together=True)
 
         snippet_search = ttk.Frame(right)
         snippet_search.pack(fill="x")
@@ -507,21 +536,24 @@ class ShinClipboardApp:
         self.snippet_tree.heading("memo", text="メモ")
         self.snippet_tree.heading("preview", text="内容")
         self.snippet_tree.heading("hotkey", text="ショートカット")
-        self.snippet_tree.column("title", width=150)
-        self.snippet_tree.column("memo", width=120)
-        self.snippet_tree.column("preview", width=250)
-        self.snippet_tree.column("hotkey", width=150)
+        # What the columns ask for is what the pane opens at, so they stay
+        # modest; the table stretches them into whatever width it then gets.
+        self.snippet_tree.column("title", width=130)
+        self.snippet_tree.column("memo", width=100)
+        self.snippet_tree.column("preview", width=220)
+        self.snippet_tree.column("hotkey", width=120)
         self.snippet_tree.pack(fill="both", expand=True, pady=6)
+        fit_tree_columns(self.snippet_tree)
         self.snippet_tree.bind("<Button-3>", self._snippet_right_click)
         self.snippet_tree.bind("<Return>", lambda _: self._paste_selected_snippet())
-        bar = ttk.Frame(right)
+        bar = FlowBar(right)
         bar.pack(fill="x")
-        ttk.Button(bar, text="追加", command=self._add_snippet).pack(side="left")
-        ttk.Button(bar, text="編集", command=self._edit_snippet).pack(side="left", padx=4)
-        ttk.Button(bar, text="削除", command=self._delete_snippet).pack(side="left")
-        ttk.Button(bar, text="↑", width=3, command=lambda: self._move_snippet(-1)).pack(side="left", padx=(8, 2))
-        ttk.Button(bar, text="↓", width=3, command=lambda: self._move_snippet(1)).pack(side="left")
-        ttk.Button(bar, text="貼り付け", command=self._paste_selected_snippet).pack(side="right")
+        bar.add(ttk.Button(bar, text="追加", command=self._add_snippet))
+        bar.add(ttk.Button(bar, text="編集", command=self._edit_snippet))
+        bar.add(ttk.Button(bar, text="削除", command=self._delete_snippet))
+        bar.add(ttk.Button(bar, text="↑", width=3, command=lambda: self._move_snippet(-1)), gap=4)
+        bar.add(ttk.Button(bar, text="↓", width=3, command=lambda: self._move_snippet(1)), together=True)
+        bar.add(ttk.Button(bar, text="貼り付け", command=self._paste_selected_snippet), right=True)
 
     def _build_fifo_tab(self) -> None:
         top = ttk.Frame(self.fifo_tab)
@@ -533,15 +565,18 @@ class ShinClipboardApp:
         ttk.Button(top, text="停止", command=self.stop_stock).pack(side="right")
         self.fifo_list = tk.Listbox(self.fifo_tab, font=(UI_FONT_FAMILY, 11))
         self.fifo_list.pack(fill="both", expand=True)
-        bar = ttk.Frame(self.fifo_tab)
+        bar = FlowBar(self.fifo_tab)
         bar.pack(fill="x", pady=(8, 0))
-        ttk.Button(bar, text="貼り付けを1つ戻す", command=self.undo_fifo).pack(side="left")
-        ttk.Button(bar, text="キューを消去", command=self.clear_fifo).pack(side="left", padx=6)
-        ttk.Button(bar, text="追加", command=self._add_stock).pack(side="left")
-        ttk.Button(bar, text="編集", command=self._edit_stock).pack(side="left", padx=6)
-        ttk.Button(bar, text="削除", command=self._delete_stock).pack(side="left")
-        ttk.Button(bar, text="全件を改行で連結", command=self._join_stock).pack(side="left", padx=6)
-        ttk.Label(bar, text="有効中は通常の貼り付けキーで先頭から順に貼り付けます。", style="Muted.TLabel").pack(side="right")
+        bar.add(ttk.Button(bar, text="貼り付けを1つ戻す", command=self.undo_fifo))
+        bar.add(ttk.Button(bar, text="キューを消去", command=self.clear_fifo))
+        bar.add(ttk.Button(bar, text="追加", command=self._add_stock))
+        bar.add(ttk.Button(bar, text="編集", command=self._edit_stock))
+        bar.add(ttk.Button(bar, text="削除", command=self._delete_stock))
+        bar.add(ttk.Button(bar, text="全件を改行で連結", command=self._join_stock))
+        bar.add(
+            ttk.Label(bar, text="有効中は通常の貼り付けキーで先頭から順に貼り付けます。", style="Muted.TLabel"),
+            right=True, wrap=True,
+        )
 
     def _build_settings_tab(self) -> None:
         form = ttk.Frame(self.settings_tab)
@@ -566,21 +601,22 @@ class ShinClipboardApp:
             self._build_permissions_section()
         transfer = ttk.LabelFrame(self.settings_tab, text="他の端末への引き継ぎ", padding=12)
         transfer.pack(fill="x", pady=20)
-        ttk.Label(
+        self._hint(
             transfer,
-            text="定型文・色・画像（ファイル込み）・整形ルール・ショートカットを1つのZIPにまとめて別の端末へ持っていけます。"
+            "定型文・色・画像（ファイル込み）・整形ルール・ショートカットを1つのZIPにまとめて別の端末へ持っていけます。"
             "取り込むときは「置き換え」か「追加」を選べます。履歴は含みません。",
-        ).pack(anchor="w")
+            style="TLabel",
+        )
         buttons = ttk.Frame(transfer)
         buttons.pack(fill="x", pady=(10, 0))
         ttk.Button(buttons, text="引き継ぎパッケージを書き出す", command=self._export_package).pack(side="left")
         ttk.Button(buttons, text="引き継ぎパッケージを取り込む", command=self._import_package).pack(side="left", padx=8)
-        ttk.Label(transfer, text="設定だけをJSONで移すこともできます（画像ファイルは含みません）。", style="Muted.TLabel").pack(anchor="w", pady=(12, 0))
+        self._hint(transfer, "設定だけをJSONで移すこともできます（画像ファイルは含みません）。", pady=(12, 0))
         json_buttons = ttk.Frame(transfer)
         json_buttons.pack(fill="x", pady=(6, 0))
         ttk.Button(json_buttons, text="設定を書き出す", command=self._export_config).pack(side="left")
         ttk.Button(json_buttons, text="設定を読み込む", command=self._import_config).pack(side="left", padx=8)
-        ttk.Label(transfer, text=f"現在: {self.store.config_path}", style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+        self._hint(transfer, f"現在: {self.store.config_path}", pady=(10, 0))
 
         advanced = ttk.LabelFrame(self.settings_tab, text="動作・表示", padding=12)
         advanced.pack(fill="x", pady=(0, 12))
@@ -599,7 +635,7 @@ class ShinClipboardApp:
         ttk.Label(advanced, text="フォントサイズ").grid(row=check_rows, column=0, sticky="w", pady=(8, 3))
         ttk.Spinbox(advanced, from_=8, to=24, textvariable=self.font_size_var, width=8).grid(row=check_rows + 1, column=0, sticky="w")
         ttk.Label(advanced, text="配色").grid(row=check_rows, column=1, sticky="w", pady=(8, 3))
-        ttk.Combobox(advanced, textvariable=self.theme_var, values=list(THEMES), state="readonly", width=15).grid(row=check_rows + 1, column=1, sticky="w")
+        ttk.Combobox(advanced, textvariable=self.theme_var, values=list(THEME_NAMES), state="readonly", width=15).grid(row=check_rows + 1, column=1, sticky="w")
 
         shots = ttk.LabelFrame(self.settings_tab, text="スクリーンショット", padding=12)
         shots.pack(fill="x", pady=(0, 12))
@@ -637,6 +673,17 @@ class ShinClipboardApp:
         ttk.Button(portability, text="定型文CSV取込", command=self._import_snippets_csv).pack(side="left", padx=6)
         ttk.Button(portability, text="全バックアップ", command=self._backup_all).pack(side="left", padx=(14, 6))
         ttk.Button(portability, text="復元", command=self._restore_all).pack(side="left")
+
+    def _hint(self, master: tk.Misc, text: str, style: str = "Muted.TLabel", **pack_options) -> ttk.Label:
+        """A sentence that wraps to the width it gets rather than pushing the window wider.
+
+        A label asks for the width of its whole text, and a pane or window gives
+        way to that request; then the end of the sentence is cut off anyway.
+        """
+        label = ttk.Label(master, text=text, style=style, wraplength=360)
+        label.pack(anchor="w", fill="x", **pack_options)
+        label.bind("<Configure>", lambda event, label=label: self._wrap_label(label, event.width))
+        return label
 
     @staticmethod
     def _wrap_label(label: ttk.Label, width: int) -> None:
@@ -760,6 +807,7 @@ class ShinClipboardApp:
             self.transform_tree.heading(key, text=label)
             self.transform_tree.column(key, width=width)
         self.transform_tree.pack(fill="both", expand=True)
+        fit_tree_columns(self.transform_tree)
         self.transform_tree.bind("<Double-Button-1>", lambda _: self._apply_selected_transform())
         bar = ttk.Frame(self.transform_tab)
         bar.pack(fill="x", pady=(8, 0))
@@ -873,6 +921,23 @@ class ShinClipboardApp:
         if token is not None:
             self.last_clipboard_token = token
 
+    def _theme_colors(self) -> dict[str, str]:
+        return theme_colors(str(self.config["settings"].get("theme", "blue")), self._dark_appearance())
+
+    def _dark_appearance(self) -> bool:
+        """Whether macOS is showing this app in dark mode; False wherever Tk cannot say."""
+        if not IS_MAC:
+            return False
+        try:
+            return bool(int(self.root.tk.call("::tk::unsupported::MacWindowStyle", "isdark", self.root)))
+        except (tk.TclError, ValueError):
+            return False
+
+    def _appearance_changed(self, _event=None) -> None:
+        """macOS switched between light and dark: repaint everything the theme colours."""
+        self._apply_appearance()
+        self._refresh_all()
+
     def _refresh_all(self) -> None:
         self._refresh_history()
         self._refresh_groups()
@@ -887,7 +952,7 @@ class ShinClipboardApp:
             return
         self.visible_history = self.history.search(self.search_var.get())
         self.history_list.delete(0, "end")
-        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        colors = self._theme_colors()
         for index, item in enumerate(self.visible_history):
             if item.kind == "image":
                 preview = f"[画像] {item.width}×{item.height}  {Path(item.image_path).name[:12]}"
@@ -918,7 +983,7 @@ class ShinClipboardApp:
             return
         self.call_history_items = self.history.search()
         self.call_history_list.delete(0, "end")
-        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        colors = self._theme_colors()
         for index, item in enumerate(self.call_history_items):
             prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
             thumbnail = self._thumbnail(item.image_path) if item.kind == "image" else None
@@ -989,7 +1054,7 @@ class ShinClipboardApp:
         group = groups[group_index]
         page.group_id = group["id"]
         page.combo.current(group_index)
-        colors = THEMES.get(self.config["settings"].get("theme", "blue"), THEMES["blue"])
+        colors = self._theme_colors()
         for item in group.get(page.items_key, []):
             index = len(page.items)
             page.items.append(item)
@@ -2393,10 +2458,14 @@ class ShinClipboardApp:
     def _apply_appearance(self) -> None:
         settings = self.config["settings"]
         size = int(settings.get("font_size", 11))
-        colors = THEMES.get(settings.get("theme", "blue"), THEMES["blue"])
-        self.root.configure(background=colors["background"])
+        colors = self._theme_colors()
+        # ttk paints its frames in the OS's window colour. On Windows that is
+        # close to the theme's white; on macOS it is a light or dark grey, and
+        # a white window shows through as a band around every ttk frame.
+        window = "systemWindowBackgroundColor" if IS_MAC else colors["background"]
+        self.root.configure(background=window)
         if hasattr(self, "call_window"):
-            self.call_window.configure(background=colors["background"])
+            self.call_window.configure(background=window)
         self.root.attributes("-topmost", bool(settings.get("always_on_top", False)))
         widgets = [getattr(self, name, None) for name in ("history_list", "group_list", "fifo_list", "call_history_list")]
         widgets += [panel.listbox for panel in (getattr(self, "color_groups", None), getattr(self, "image_groups", None)) if panel]
@@ -2637,10 +2706,13 @@ class ShinClipboardApp:
         self.start_capture(max(1, delay))
 
     def _begin_capture(self, wait: bool = False) -> None:
+        # The last shot's editor is hidden with the rest so it stays out of the
+        # picture; it is closed for good once the new shot exists, and comes
+        # back like the others if the capture is aborted.
+        candidates = [self.root, getattr(self, "call_window", None)]
+        candidates += [editor.window for editor in self._screenshot_editors()]
         self._hidden_for_capture = [
-            window
-            for window in [self.root, getattr(self, "call_window", None)]
-            if window is not None and window.winfo_viewable()
+            window for window in candidates if window is not None and window.winfo_viewable()
         ]
         for window in self._hidden_for_capture:
             window.withdraw()
@@ -2723,10 +2795,16 @@ class ShinClipboardApp:
             self.status_var.set("スクリーンショットを中止しました")
             return
         # Captured: only the editor should appear. Restoring the settings or the
-        # popup here would raise them on top of it on every single shot.
+        # popup here would raise them on top of it on every single shot, and the
+        # previous shot's editor is replaced rather than left to pile up.
         # The plain capture is usable straight away; the editor is optional.
+        for editor in self._screenshot_editors():
+            editor.close()
         self._copy_capture(image)
-        self.open_editor(image, f"スクリーンショット {image.width}×{image.height}")
+        self.open_editor(image, f"スクリーンショット {image.width}×{image.height}", from_screenshot=True)
+
+    def _screenshot_editors(self) -> list[ImageEditorWindow]:
+        return [editor for editor in list(self.editors) if editor.from_screenshot]
 
     def _copy_capture(self, image: Image.Image) -> None:
         try:
@@ -2742,9 +2820,11 @@ class ShinClipboardApp:
             self._refresh_history()
         self.status_var.set(f"スクリーンショットをクリップボードへコピーしました（{image.width}×{image.height}）")
 
-    def open_editor(self, image: Image.Image, title: str = "画像編集") -> ImageEditorWindow | None:
+    def open_editor(
+        self, image: Image.Image, title: str = "画像編集", from_screenshot: bool = False
+    ) -> ImageEditorWindow | None:
         try:
-            editor = ImageEditorWindow(self, image, title)
+            editor = ImageEditorWindow(self, image, title, from_screenshot=from_screenshot)
         except (OSError, ValueError, tk.TclError) as error:
             messagebox.showerror("画像編集", str(error))
             return None
@@ -2882,6 +2962,10 @@ def run(argv: list[str] | None = None) -> None:
         root = tk.Tk()
         app = ShinClipboardApp(root, JsonStore(args.data_dir, args.config))
         instance.start_listener(lambda: app.events.put(("show", None)))
+        # The editor's font menu needs every font file opened once; that takes
+        # seconds, so it happens here in the background rather than on the
+        # first screenshot, and is remembered between launches.
+        FONT_CATALOG.start(app.store.data_dir / "fonts.json")
         root.mainloop()
     finally:
         instance.close()

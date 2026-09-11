@@ -1,17 +1,24 @@
+import platform
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageFont
 
+from shinclipboard import annotations
+from shinclipboard.fonts import FontCatalog, FontFace
 from shinclipboard.annotations import (
     AnnotationDocument,
     AnnotationHistory,
     Shape,
     effective_blur_radius,
     effective_pixel_block,
+    has_glyphs,
     hit_test,
     render,
     render_raster,
     resolve_font,
+    text_line_height,
 )
 
 
@@ -55,9 +62,59 @@ class RenderTests(unittest.TestCase):
         result = render(_base(), document).convert("RGB")
         self.assertLess(min(sum(pixel) for pixel in result.getdata()), 3 * 255, "some dark pixels were drawn")
 
+    def test_a_text_is_drawn_in_its_chosen_family_when_the_catalog_has_it(self):
+        mincho = Path("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc")
+        if not mincho.exists():
+            self.skipTest("uses the fonts that ship with macOS")
+        catalog = FontCatalog([FontFace("Hiragino Mincho ProN", "W3", str(mincho))])
+        with patch.object(annotations, "CATALOG", catalog):
+            self.assertEqual(resolve_font(24, "Hiragino Mincho ProN").getname(), ("Hiragino Mincho ProN", "W3"))
+            self.assertEqual(resolve_font(24, "Unknown Family").getname(), resolve_font(24).getname(),
+                             "a family the catalog lacks falls back to the default face")
+            plain = render(_base(), AnnotationDocument([Shape("text", [(10, 10)], text="注釈", font_size=24)]))
+            styled = render(_base(), AnnotationDocument([
+                Shape("text", [(10, 10)], text="注釈", font_size=24, font="Hiragino Mincho ProN"),
+            ]))
+            self.assertNotEqual(plain.tobytes(), styled.tobytes())
+            self.assertNotEqual(text_line_height(24, "Hiragino Mincho ProN"), None)
+
+    def test_a_family_whose_file_is_gone_falls_back_to_the_default(self):
+        catalog = FontCatalog([FontFace("Ghost", "Regular", "/nowhere/ghost.ttf")])
+        with patch.object(annotations, "CATALOG", catalog):
+            self.assertEqual(resolve_font(24, "Ghost").getname(), resolve_font(24).getname())
+
+    def test_the_line_pitch_is_the_one_a_multi_line_export_uses(self):
+        # The preview draws one canvas item per line at this pitch, so it must
+        # be exactly where ImageDraw puts the second line of a "\n" text.
+        pitch = text_line_height(24)
+        joined = AnnotationDocument([Shape("text", [(10, 10)], text="行1\n行2", color="#000000", font_size=24)])
+        split = AnnotationDocument([
+            Shape("text", [(10, 10)], text="行1", color="#000000", font_size=24),
+            Shape("text", [(10, 10 + pitch)], text="行2", color="#000000", font_size=24),
+        ])
+        self.assertEqual(render(_base(), joined).tobytes(), render(_base(), split).tobytes())
+
     def test_resolve_font_always_returns_a_font(self):
         self.assertIsNotNone(resolve_font(24))
         self.assertIsNotNone(resolve_font(1), "tiny sizes are clamped, not rejected")
+
+    def test_a_scalable_font_is_only_chosen_when_it_covers_japanese(self):
+        font = resolve_font(24)
+        if not isinstance(font, ImageFont.FreeTypeFont):
+            self.skipTest("no scalable font is installed")
+        # "ー" is the character that turned into a box: Pillow could not find
+        # Hiragino by its decomposed file name and fell back to a Korean face.
+        self.assertTrue(has_glyphs(font, "キーボード"), font.getname())
+
+    @unittest.skipUnless(platform.system() == "Darwin", "uses the fonts that ship with macOS")
+    def test_a_face_missing_the_prolonged_sound_mark_is_detected(self):
+        path = Path("/System/Library/Fonts/Supplemental/AppleGothic.ttf")
+        if not path.exists():
+            self.skipTest("AppleGothic is not installed")
+        korean = ImageFont.truetype(str(path), 24)
+        self.assertTrue(has_glyphs(korean, "あ"), "the probe must not reject glyphs the face does have")
+        self.assertFalse(has_glyphs(korean, "ー"))
+        self.assertNotEqual(resolve_font(24).getname()[0], "AppleGothic")
 
 
 class RasterEffectTests(unittest.TestCase):

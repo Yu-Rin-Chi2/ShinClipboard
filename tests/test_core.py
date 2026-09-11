@@ -3,6 +3,7 @@ import threading
 import unittest
 import unittest.mock
 from pathlib import Path
+from tkinter import ttk
 
 from PIL import Image
 
@@ -244,6 +245,45 @@ class SettingsTabTests(unittest.TestCase):
 
                 scroller._canvas.yview_moveto(1.0)
                 self.assertAlmostEqual(scroller._canvas.yview()[1], 1.0, places=3)
+        finally:
+            _destroy_root(root)
+
+
+class WheelScrollTests(unittest.TestCase):
+    def test_wheel_units_handle_both_platforms(self):
+        from shinclipboard.widgets import WHEEL_STEP, wheel_units
+
+        self.assertEqual(wheel_units(-120), WHEEL_STEP, "Windows: one notch down")
+        self.assertEqual(wheel_units(240), -2 * WHEEL_STEP, "Windows: two notches up")
+        self.assertEqual(wheel_units(-1), WHEEL_STEP, "macOS: one tick down")
+        self.assertEqual(wheel_units(2), -2 * WHEEL_STEP, "macOS: two ticks up")
+        self.assertEqual(wheel_units(0), 0)
+
+    def test_image_listbox_scrolls_on_a_macos_wheel_tick(self):
+        import tkinter as tk
+
+        from shinclipboard.widgets import ImageListbox
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            listbox = ImageListbox(root, height=5)
+            listbox.pack()
+            for index in range(100):
+                listbox.insert("end", f"row {index}")
+            root.update_idletasks()
+            self.assertEqual(listbox.yview()[0], 0.0)
+
+            listbox.event_generate("<MouseWheel>", delta=-1)  # macOS reports small counts, not multiples of 120
+            root.update()
+            self.assertGreater(listbox.yview()[0], 0.0, "a single macOS tick has to move the list")
+
+            listbox.event_generate("<MouseWheel>", delta=1)
+            root.update()
+            self.assertEqual(listbox.yview()[0], 0.0, "and the opposite tick brings it back")
         finally:
             _destroy_root(root)
 
@@ -582,6 +622,76 @@ class ScreenshotStorageTests(unittest.TestCase):
             self.assertEqual(settings["annotation_color"], "#e02424")
 
 
+class AppearanceTests(unittest.TestCase):
+    def _app(self, root, folder):
+        from shinclipboard.app import ShinClipboardApp
+
+        namespace = {"_start_tray": lambda self: None, "_restart_hotkeys": lambda self: None}
+        return type("HeadlessApp", (ShinClipboardApp,), namespace)(root, JsonStore(Path(folder)))
+
+    def test_the_system_theme_resolves_by_appearance_and_named_themes_do_not(self):
+        from shinclipboard.app import THEME_NAMES, THEMES, theme_colors
+
+        self.assertEqual(theme_colors("system", dark=True), THEMES["dark"])
+        self.assertEqual(theme_colors("system", dark=False), THEMES["blue"])
+        self.assertEqual(theme_colors("blue", dark=True), THEMES["blue"])
+        self.assertEqual(theme_colors("green", dark=False), THEMES["green"])
+        self.assertEqual(theme_colors("no such theme", dark=True), THEMES["blue"])
+        self.assertEqual(THEME_NAMES[0], "system", "offered first in the settings, as the default")
+
+    def test_the_window_takes_the_os_colour_on_macos_and_the_theme_colour_elsewhere(self):
+        import platform
+        import tkinter as tk
+
+        from shinclipboard.app import THEMES
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                # ttk frames are painted in the OS window colour there, and a
+                # white root showed through as a band around every one of them.
+                if platform.system() == "Darwin":
+                    app = self._app(root, folder)
+                    self.assertEqual(str(app.root.cget("background")), "systemWindowBackgroundColor")
+                    self.assertEqual(str(app.call_window.cget("background")), "systemWindowBackgroundColor")
+                    # The default theme follows the OS: dark lists in dark mode, blue otherwise.
+                    expected = THEMES["dark" if app._dark_appearance() else "blue"]["background"]
+                    self.assertEqual(str(app.history_list.cget("background")), expected)
+                    app.config["settings"]["theme"] = "blue"
+                    app._apply_appearance()
+                    self.assertEqual(str(app.history_list.cget("background")), "#ffffff", "a named theme is fixed")
+                    self.assertEqual(str(app.root.cget("background")), "systemWindowBackgroundColor")
+                with unittest.mock.patch("shinclipboard.app.IS_MAC", False):
+                    app = self._app(root, folder)
+                    self.assertEqual(str(app.root.cget("background")), "#ffffff", "system means blue off macOS")
+                    self.assertEqual(str(app.history_list.cget("background")), "#ffffff")
+        finally:
+            _destroy_root(root)
+
+    def test_the_status_line_outlives_tabs_that_ask_for_too_much_height(self):
+        import tkinter as tk
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Tk is unavailable: {error}")
+        root.geometry("+3000+3000")
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                root.geometry("700x300")  # far shorter than the tabs want
+                root.update()
+                status = next(child for child in root.winfo_children() if isinstance(child, ttk.Label))
+                self.assertTrue(status.winfo_ismapped(), "pack gives way from the last slave in, so it is packed first")
+                self.assertTrue(app.tabs.winfo_ismapped())
+        finally:
+            _destroy_root(root)
+
+
 class ScreenshotAppTests(unittest.TestCase):
     """GUI tests. Like the popup tests they never map or focus a window."""
 
@@ -800,6 +910,318 @@ class ScreenshotAppTests(unittest.TestCase):
                 app._hidden_for_capture = [app.root, app.call_window]
                 app._capture_done(None)
                 self.assertEqual(shown, ["settings", "popup"], "an aborted shot restores what was open")
+        finally:
+            _destroy_root(root)
+
+    def test_a_new_shot_replaces_the_previous_screenshot_editor_only(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=1):
+                    app.capturing = True
+                    app._capture_done(Image.new("RGB", (8, 8), "red"))
+                    first = next(iter(app.editors))
+                    self.assertTrue(first.from_screenshot)
+                    # An editor opened from the history is not a shot and is left alone.
+                    relative, width, height = app.store.save_image(Image.new("RGB", (4, 4), "blue"))
+                    app.history.add_image(relative, width, height)
+                    app._edit_image_item(app.history.search()[0])
+                    kept = next(editor for editor in app.editors if editor is not first)
+                    self.assertFalse(kept.from_screenshot)
+
+                    # The old editor would otherwise be in the picture, so the
+                    # capture hides it along with the app's own windows.
+                    hidden: list[str] = []
+                    first.window.winfo_viewable = lambda: True
+                    first.window.withdraw = lambda: hidden.append("editor")
+                    kept.window.winfo_viewable = lambda: True
+                    kept.window.withdraw = lambda: hidden.append("history editor")
+                    with unittest.mock.patch("shinclipboard.app.RegionSelector"):
+                        app._begin_capture()
+                    self.assertEqual(hidden, ["editor"])
+                    self.assertIn(first.window, app._hidden_for_capture)
+
+                    app._capture_done(Image.new("RGB", (16, 16), "green"))
+                self.assertNotIn(first, app.editors, "the previous shot's editor is closed")
+                self.assertIn(kept, app.editors)
+                shots = [editor for editor in app.editors if editor.from_screenshot]
+                self.assertEqual([editor.base.size for editor in shots], [(16, 16)])
+                for editor in list(app.editors):
+                    editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_an_aborted_shot_brings_the_previous_screenshot_editor_back(self):
+        from shinclipboard import app as app_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch.object(app_module, "write_clipboard_image", return_value=1):
+                    app.capturing = True
+                    app._capture_done(Image.new("RGB", (8, 8), "red"))
+                editor = next(iter(app.editors))
+                restored: list[str] = []
+                editor.window.deiconify = lambda: restored.append("editor")
+                app.capturing = True
+                app._hidden_for_capture = [editor.window]
+                app._capture_done(None)
+                self.assertEqual(restored, ["editor"])
+                self.assertEqual(app.editors, {editor}, "nothing is closed when no shot was taken")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_the_editor_answers_to_the_command_key_on_macos(self):
+        from shinclipboard import editor as editor_module
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch.object(editor_module, "IS_MAC", True):
+                    editor = app.open_editor(Image.new("RGB", (8, 8), "red"))
+                for key in ("z", "y", "c", "s", "Key-0"):
+                    self.assertTrue(editor.window.bind(f"<Command-{key}>"), key)
+                    self.assertTrue(editor.window.bind(f"<Control-{key}>"), "Ctrl keeps working too")
+                self.assertTrue(editor.canvas.bind("<Command-MouseWheel>"))
+                editor.close()
+
+                with unittest.mock.patch.object(editor_module, "IS_MAC", False):
+                    editor = app.open_editor(Image.new("RGB", (8, 8), "red"))
+                self.assertFalse(editor.window.bind("<Command-z>"), "Windows has no Command key")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_copy_and_undo_keys_leave_an_open_text_box_alone(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (80, 40), "red"))
+                copied: list[str] = []
+                editor.copy_to_clipboard = lambda: copied.append("image") or "break"
+                editor._open_text_box(5, 5)
+                editor._text_box.insert("1.0", "キー")
+                self.assertIsNone(editor._on_copy_key(), "Cmd+C while typing copies the text, not the picture")
+                self.assertEqual(copied, [])
+                self.assertEqual(editor.redo(), "break")
+                self.assertIsNotNone(editor._text_box, "and the box is still open")
+                editor._commit_text_box()
+                self.assertEqual([shape.text for shape in editor.document.shapes], ["キー"])
+                self.assertEqual(editor._on_copy_key(), "break")
+                self.assertEqual(copied, ["image"])
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_the_preview_is_drawn_with_the_face_the_export_uses(self):
+        from shinclipboard import editor as editor_module
+        from shinclipboard.annotations import resolve_font
+        from shinclipboard.platform_support import UI_FONT_FAMILY
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (8, 8), "red"))
+                exported = resolve_font(24).getname()[0]
+                self.assertEqual(editor._font_family, exported, "Tk knows the exported face by this name")
+                self.assertEqual(editor._font(24)[0], exported)
+                editor.close()
+
+                fake = unittest.mock.Mock()
+                fake.getname.return_value = ("No Such Face 1234", "Regular")
+                with unittest.mock.patch.object(editor_module, "resolve_font", return_value=fake):
+                    self.assertEqual(
+                        editor_module.preview_font_family(root), UI_FONT_FAMILY,
+                        "a face Tk cannot find falls back to the UI font instead of Tk's silent substitute",
+                    )
+        finally:
+            _destroy_root(root)
+
+    def test_the_preview_places_text_where_the_export_draws_it(self):
+        from shinclipboard.annotations import Shape, resolve_font, text_line_height
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (400, 200), "white"))
+                editor.set_zoom(1.0)
+                editor.document.shapes.append(Shape("text", [(20, 30)], text="キー\n2行目", color="#e02424", font_size=32))
+                editor.refresh()
+                items = editor.canvas.find_withtag(editor.document.shapes[0].id)
+                self.assertEqual(len(items), 2, "one canvas item per line")
+                # PIL puts the baseline `ascent` below the point it is given; a
+                # canvas item is placed so that its own baseline lands there too,
+                # whatever Tk pads above the ascender for this face.
+                pil_ascent = resolve_font(32).getmetrics()[0]
+                tk_ascent = editor._tk_font(32).metrics("ascent")
+                first_top = editor.canvas.coords(items[0])[1] - editor._offset[1]
+                self.assertEqual(first_top + tk_ascent, 30 + pil_ascent)
+                second_top = editor.canvas.coords(items[1])[1] - editor._offset[1]
+                self.assertEqual(second_top - first_top, text_line_height(32), "lines keep the export's pitch")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_changing_the_font_size_or_colour_while_typing_changes_the_text(self):
+        from shinclipboard.annotations import Shape
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (200, 100), "white"))
+                editor.set_zoom(1.0)
+                editor.font_size_var.set("24")
+                editor._open_text_box(5, 5)
+                editor._text_box.insert("1.0", "キー")
+                editor.font_size_var.set("48")
+                editor._pick_color("#2563eb")
+                box_pixels = lambda: int(root.tk.splitlist(editor._text_box.cget("font"))[1])  # noqa: E731
+                self.assertEqual(box_pixels(), -48, "the box is redrawn at the new size")
+                self.assertEqual(editor._text_box.cget("foreground"), "#2563eb")
+                editor.font_size_var.set("")  # half-typed in the spinbox
+                self.assertEqual(box_pixels(), -48, "an unreadable size keeps the last one")
+                editor._commit_text_box()
+                shape = editor.document.shapes[0]
+                self.assertEqual((shape.text, shape.font_size, shape.color), ("キー", 48, "#2563eb"))
+
+                # Reopening an existing text shows its own size and colour in the
+                # toolbar, so a nudge of the spinbox grows *this* text.
+                editor.font_size_var.set("24")
+                editor._pick_color("#e02424")
+                editor._open_text_box(*shape.points[0], shape=shape)
+                self.assertEqual(editor.font_size_var.get(), "48")
+                self.assertEqual(editor.color_var.get(), "#2563eb")
+                editor.font_size_var.set("50")
+                editor._commit_text_box()
+                self.assertEqual([(s.text, s.font_size, s.color) for s in editor.document.shapes], [("キー", 50, "#2563eb")])
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_the_text_box_is_wide_enough_for_japanese(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (200, 100), "white"))
+                editor.set_zoom(1.0)
+                editor._open_text_box(5, 5)
+                text = "キーボードショートカット一覧です"
+                editor._text_box.insert("1.0", text)
+                editor._grow_text_box()
+                font = editor._tk_font(editor._pixels(editor._text_box_size))
+                needed = font.measure(text) / font.measure("0")
+                self.assertGreaterEqual(int(editor._text_box.cget("width")), needed, "a kana is about two '0's wide")
+                editor._cancel_text_box()
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_the_font_menu_offers_the_catalog_and_the_choice_is_kept(self):
+        from shinclipboard import editor as editor_module
+        from shinclipboard.annotations import Shape
+        from shinclipboard.fonts import FontCatalog, FontFace
+
+        mincho = Path("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc")
+        if not mincho.exists():
+            self.skipTest("uses the fonts that ship with macOS")
+        catalog = FontCatalog([FontFace("Hiragino Mincho ProN", "W3", str(mincho))])
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder, \
+                    unittest.mock.patch.object(editor_module, "CATALOG", catalog), \
+                    unittest.mock.patch("shinclipboard.annotations.CATALOG", catalog):
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (200, 100), "white"))
+                editor.set_zoom(1.0)
+                self.assertEqual(editor.font_var.get(), "（標準）")
+                self.assertEqual(list(editor.font_combo["values"]), ["（標準）", "Hiragino Mincho ProN"])
+
+                # Picking a family while typing restyles the box and the committed text.
+                editor._open_text_box(5, 5)
+                editor._text_box.insert("1.0", "注釈")
+                editor.font_var.set("Hiragino Mincho ProN")
+                editor._font_chosen()
+                self.assertEqual(root.tk.splitlist(editor._text_box.cget("font"))[0], "Hiragino Mincho ProN")
+                editor._commit_text_box()
+                shape = editor.document.shapes[0]
+                self.assertEqual(shape.font, "Hiragino Mincho ProN")
+                self.assertEqual(editor._font(24, shape.font)[0], "Hiragino Mincho ProN", "the preview uses it too")
+                self.assertEqual(app.config["settings"]["annotation_font"], "Hiragino Mincho ProN")
+                self.assertEqual(
+                    app.store.load_config()["settings"]["annotation_font"], "Hiragino Mincho ProN", "and it is saved"
+                )
+
+                # Reopening the text shows its family; a fresh editor starts from the saved one.
+                editor.font_var.set("（標準）")
+                editor._open_text_box(*shape.points[0], shape=shape)
+                self.assertEqual(editor.font_var.get(), "Hiragino Mincho ProN")
+                editor._cancel_text_box()
+                self.assertEqual(shape.font, "Hiragino Mincho ProN", "cancelling changes nothing")
+                editor.close()
+                second = app.open_editor(Image.new("RGB", (8, 8), "white"))
+                self.assertEqual(second.font_var.get(), "Hiragino Mincho ProN")
+                self.assertEqual(second._new_shape("text", [(0, 0)]).font, "Hiragino Mincho ProN")
+
+                # With the select tool, a pick restyles the selected text and can be undone.
+                second.document.shapes.append(Shape("text", [(1, 1)], text="x", font_size=12))
+                second.selected_id = second.document.shapes[0].id
+                second.font_var.set("（標準）")
+                second._font_chosen()
+                self.assertEqual(second.document.shapes[0].font, "")
+                second.font_var.set("Hiragino Mincho ProN")
+                second._font_chosen()
+                self.assertEqual(second.document.shapes[0].font, "Hiragino Mincho ProN")
+                second.undo()
+                self.assertEqual(second.document.shapes[0].font, "")
+                second.close()
+        finally:
+            _destroy_root(root)
+
+    def test_a_family_tk_does_not_know_previews_in_the_default_face(self):
+        from shinclipboard import editor as editor_module
+        from shinclipboard.fonts import FontCatalog, FontFace
+
+        catalog = FontCatalog([FontFace("No Such Face 1234", "Regular", "/nowhere.ttf")])
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder, unittest.mock.patch.object(editor_module, "CATALOG", catalog):
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (8, 8), "white"))
+                self.assertEqual(editor._font(24, "No Such Face 1234")[0], editor._font_family)
+                self.assertEqual(editor._font(24, "")[0], editor._font_family)
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_the_font_menu_fills_itself_once_the_background_scan_is_done(self):
+        from shinclipboard import editor as editor_module
+        from shinclipboard.fonts import FontCatalog, FontFace
+
+        catalog = FontCatalog()  # not scanned yet
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder, unittest.mock.patch.object(editor_module, "CATALOG", catalog):
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (8, 8), "white"))
+                self.assertEqual(list(editor.font_combo["values"]), ["（標準）"])
+                self.assertIsNotNone(editor._font_menu_job, "the editor keeps looking")
+                catalog._install([FontFace("Fake Family", "Regular", "/nowhere.ttf")])
+                editor.window.after_cancel(editor._font_menu_job)
+                editor._watch_font_catalog()
+                self.assertEqual(list(editor.font_combo["values"]), ["（標準）", "Fake Family"])
+                self.assertIsNone(editor._font_menu_job, "and stops once the list is in")
+                editor.close()
         finally:
             _destroy_root(root)
 

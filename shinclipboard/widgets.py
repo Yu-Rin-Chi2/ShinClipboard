@@ -5,6 +5,154 @@ from collections.abc import Callable
 from tkinter import messagebox, simpledialog, ttk
 from uuid import uuid4
 
+from .platform_support import IS_MAC
+
+WHEEL_STEP = 3  # list rows per wheel notch, matching the other lists
+# Characters of the group list, which is what its pane opens at. On Windows it
+# is sized to keep the add / rename / delete / up / down row under it on one
+# line; on macOS the buttons are too broad for that at any sensible width, so
+# the row wraps and the table beside the list gets the space instead.
+GROUP_LIST_WIDTH = 24 if IS_MAC else 34
+
+
+def wheel_units(delta: int) -> int:
+    """Rows to scroll for a <MouseWheel> event with the given delta.
+
+    Windows reports the wheel in multiples of 120 per notch; macOS reports small
+    counts (often 1 per tick), so dividing by 120 there rounds every event down
+    to nothing and the list never moves.
+    """
+    notches = int(delta / 120) if abs(delta) >= 120 else delta
+    return -notches * WHEEL_STEP
+
+
+class FlowBar(ttk.Frame):
+    """A row of controls that wraps onto further rows when the width runs out.
+
+    pack and grid never wrap: a row of buttons wider than its frame simply
+    loses its end, and macOS draws every button a third wider than Windows, so
+    rows laid out to fit there come up short here. Children are added in order
+    with `add()`; those added with `right=True` sit against the right edge, as
+    `pack(side="right")` would put them, and drop to a row of their own when
+    the left-hand ones leave no room. `together=True` keeps a child on the same
+    row as the one before it - a pair of up / down buttons should not split. A
+    label added with `wrap=True` is re-wrapped to the width it gets instead of
+    being cut off.
+
+    The frame asks for the height its rows need and next to no width, so a
+    narrow window wraps the row rather than clipping it.
+    """
+
+    GAP = 4  # between neighbours
+    ROW_GAP = 4
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self._groups: list[list[tuple[tk.Widget, int]]] = []  # runs of (widget, gap before it)
+        self._right: list[bool] = []  # per group
+        self._wrapped: list[tk.Widget] = []
+        self._laid_out: tuple[int, ...] | None = None
+        self.bind("<Configure>", lambda event: self._reflow(event.width))
+
+    def add(
+        self, widget: tk.Widget, gap: int = 0, right: bool = False, together: bool = False, wrap: bool = False
+    ) -> tk.Widget:
+        """Append `widget` (a child of this bar). `gap` is extra space before it."""
+        if together and self._groups and self._right[-1] == right:
+            self._groups[-1].append((widget, gap))
+        else:
+            self._groups.append([(widget, gap)])
+            self._right.append(right)
+        if wrap:
+            self._wrapped.append(widget)
+        self._laid_out = None
+        if self.winfo_width() > 1:
+            self._reflow(self.winfo_width())
+        else:
+            # Not laid out yet, so the width is unknown. Ask for one row rather
+            # than the tower a 1px-wide layout would be: a tab that is not
+            # showing never gets a real width, and its request still sizes the
+            # window.
+            self.configure(height=max(item.winfo_reqheight() for group in self._groups for item, _ in group), width=1)
+        return widget
+
+    def _reflow(self, width: int) -> None:
+        if width <= 1:
+            return  # not mapped yet
+        signature = (width, sum(len(group) for group in self._groups))
+        if signature == self._laid_out:
+            return
+        self._laid_out = signature
+        for widget in self._wrapped:
+            widget.configure(wraplength=width)
+        rows: list[list[tuple[tk.Widget, int]]] = [[]]  # per row: (widget, x)
+        x = 0
+        for group, right in zip(self._groups, self._right):
+            if right:
+                continue
+            span = sum(gap + item.winfo_reqwidth() for item, gap in group) + self.GAP * (len(group) - 1)
+            if rows[-1] and x + span > width:
+                rows.append([])
+                x = 0
+            for index, (item, gap) in enumerate(group):
+                x += gap if (index or rows[-1]) else 0
+                rows[-1].append((item, x))
+                x += item.winfo_reqwidth() + self.GAP
+        left_end = x  # where the last left-hand row stops
+        right_rows: list[list[tuple[tk.Widget, int]]] = []
+        edge = width
+        for group, right in zip(self._groups, self._right):
+            if not right:
+                continue
+            span = sum(gap + item.winfo_reqwidth() for item, gap in group) + self.GAP * (len(group) - 1)
+            if not right_rows and edge - span >= left_end:
+                row = rows[-1]  # shares the last left-hand row
+            else:
+                if not right_rows or edge - span < 0:
+                    right_rows.append([])
+                    edge = width
+                row = right_rows[-1]
+            for item, gap in group:
+                edge -= item.winfo_reqwidth() + gap
+                row.append((item, edge))
+                edge -= self.GAP
+        y = 0
+        for row in rows + right_rows:
+            if not row:
+                continue
+            height = max(item.winfo_reqheight() for item, _x in row)
+            for item, item_x in row:
+                item.place(x=item_x, y=y + (height - item.winfo_reqheight()) // 2)
+            y += height + self.ROW_GAP
+        self.configure(height=max(1, y - self.ROW_GAP), width=1)
+
+
+def fit_tree_columns(tree: ttk.Treeview) -> None:
+    """Keep a table's stretchable columns inside the width the table is given.
+
+    Treeview grows and shrinks its columns with the window - except on the first
+    layout, where a table narrower than its columns keeps them as asked and
+    clips the last one instead. Once the columns have been fitted by hand the
+    widget tracks later resizes on its own.
+    """
+
+    def fit(event) -> None:
+        shown = [column for column in ("#0", *tree.cget("columns")) if column != "#0" or "tree" in str(tree.cget("show"))]
+        widths = {column: int(tree.column(column, "width")) for column in shown}
+        available = event.width - 4  # the border
+        if sum(widths.values()) <= available:
+            return
+        stretchable = [column for column in shown if int(tree.column(column, "stretch"))]
+        if not stretchable:
+            return
+        fixed = sum(width for column, width in widths.items() if column not in stretchable)
+        share = sum(widths[column] for column in stretchable)
+        for column in stretchable:
+            wanted = int(widths[column] * max(0, available - fixed) / share)
+            tree.column(column, width=max(int(tree.column(column, "minwidth")), wanted))
+
+    tree.bind("<Configure>", fit, add="+")
+
 
 class GroupPanel(ttk.Frame):
     """The group column of a library tab: a list plus add / rename / delete / reorder.
@@ -32,16 +180,16 @@ class GroupPanel(ttk.Frame):
         self._on_change = on_change
         self._on_select = on_select
         ttk.Label(self, text="グループ").pack(anchor="w")
-        self.listbox = tk.Listbox(self, exportselection=False, font=font)
+        self.listbox = tk.Listbox(self, exportselection=False, font=font, width=GROUP_LIST_WIDTH)
         self.listbox.pack(fill="both", expand=True, pady=6)
         self.listbox.bind("<<ListboxSelect>>", lambda _: self._on_select())
-        bar = ttk.Frame(self)
+        bar = FlowBar(self)
         bar.pack(fill="x")
-        ttk.Button(bar, text="追加", command=self.add).pack(side="left")
-        ttk.Button(bar, text="名前変更", command=self.rename).pack(side="left", padx=4)
-        ttk.Button(bar, text="削除", command=self.delete).pack(side="left", padx=4)
-        ttk.Button(bar, text="↑", width=3, command=lambda: self.move(-1)).pack(side="left")
-        ttk.Button(bar, text="↓", width=3, command=lambda: self.move(1)).pack(side="left", padx=2)
+        bar.add(ttk.Button(bar, text="追加", command=self.add))
+        bar.add(ttk.Button(bar, text="名前変更", command=self.rename))
+        bar.add(ttk.Button(bar, text="削除", command=self.delete))
+        bar.add(ttk.Button(bar, text="↑", width=3, command=lambda: self.move(-1)), gap=4)
+        bar.add(ttk.Button(bar, text="↓", width=3, command=lambda: self.move(1)), together=True)
 
     def selected_index(self) -> int | None:
         selected = self.listbox.curselection()
@@ -112,8 +260,6 @@ class ScrollableFrame(ttk.Frame):
     the visible area so anything packed with `fill="x"` still stretches.
     """
 
-    WHEEL_STEP = 3  # list rows per wheel notch, matching the other lists
-
     def __init__(self, master=None, **kwargs):
         super().__init__(master)
         self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, takefocus=0)
@@ -142,19 +288,13 @@ class ScrollableFrame(ttk.Frame):
         self._canvas.itemconfigure(self._body_id, width=event.width)
 
     def _bind_wheel(self) -> None:
-        self._canvas.bind_all("<MouseWheel>", self._on_wheel)
-        self._canvas.bind_all("<Button-4>", lambda _: self._scroll_by(-self.WHEEL_STEP))
-        self._canvas.bind_all("<Button-5>", lambda _: self._scroll_by(self.WHEEL_STEP))
+        self._canvas.bind_all("<MouseWheel>", lambda event: self._scroll_by(wheel_units(event.delta)))
+        self._canvas.bind_all("<Button-4>", lambda _: self._scroll_by(-WHEEL_STEP))
+        self._canvas.bind_all("<Button-5>", lambda _: self._scroll_by(WHEEL_STEP))
 
     def _unbind_wheel(self) -> None:
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self._canvas.unbind_all(sequence)
-
-    def _on_wheel(self, event) -> None:
-        # Windows reports the wheel in multiples of 120; macOS in small counts.
-        delta = event.delta
-        steps = -int(delta / 120) if abs(delta) >= 120 else -delta
-        self._scroll_by(steps * self.WHEEL_STEP)
 
     def _scroll_by(self, units: int) -> None:
         if units:
@@ -180,6 +320,13 @@ class ImageListbox(tk.Text):
         kwargs.setdefault("insertwidth", 0)
         kwargs.setdefault("spacing1", 1)
         kwargs.setdefault("spacing3", 1)
+        # A Text on macOS draws a 3px focus ring in the text colour, and this
+        # list holds the focus whenever the popup is open: in dark mode that is
+        # a white frame around it. A list gets the Listbox's thin border instead.
+        kwargs.setdefault("highlightthickness", 0)
+        if IS_MAC:
+            kwargs.setdefault("relief", "solid")
+            kwargs.setdefault("borderwidth", 1)
         super().__init__(master, **kwargs)
         self._rows: list[dict[str, object]] = []
         self._selected: int | None = None
@@ -195,9 +342,9 @@ class ImageListbox(tk.Text):
         self.bind("<Next>", lambda _: self._move(self._visible_rows()))
         self.bind("<Home>", lambda _: self._select_and_see(0))
         self.bind("<End>", lambda _: self._select_and_see(len(self._rows) - 1))
-        self.bind("<MouseWheel>", lambda event: self._scroll(-int(event.delta / 120) * 3))
-        self.bind("<Button-4>", lambda _: self._scroll(-3))
-        self.bind("<Button-5>", lambda _: self._scroll(3))
+        self.bind("<MouseWheel>", lambda event: self._scroll(wheel_units(event.delta)))
+        self.bind("<Button-4>", lambda _: self._scroll(-WHEEL_STEP))
+        self.bind("<Button-5>", lambda _: self._scroll(WHEEL_STEP))
 
     # ----- Listbox-compatible API -------------------------------------------------
 

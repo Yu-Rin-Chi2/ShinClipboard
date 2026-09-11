@@ -39,7 +39,7 @@ def default_config() -> dict[str, Any]:
             "clear_history_on_exit": False,
             "always_on_top": False,
             "font_size": 11,
-            "theme": "blue",
+            "theme": "system",  # the OS's light or dark look on macOS; blue elsewhere
             # `primary+shift+s` is "save as" in most editors, and pynput does not
             # suppress the keys it watches, so both would fire. Alt keeps clear.
             "screenshot_hotkey": "primary+alt+s",
@@ -51,6 +51,7 @@ def default_config() -> dict[str, Any]:
             "screenshot_save_to_history": True,
             "annotation_color": "#e02424",
             "annotation_width": 4,
+            "annotation_font": "",  # a family from the font catalog; empty for the platform's default
         },
         "transforms": [
             {"id": str(uuid4()), "name": "各行先頭に > を挿入", "type": "prefix_each_line", "params": {"prefix": "> "}, "hotkey": "", "auto": False, "enabled": True},
