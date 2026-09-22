@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
@@ -87,6 +88,8 @@ CALL_WINDOW_HINT = (
     "Tab: 履歴/定型文/色/画像   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
     "Ctrl+E: 画像を編集   ドラッグ: 他アプリへ   Esc: 閉じる"
 )
+CALL_TAB_HPAD = 22  # minimum horizontal padding on each side of a popup tab's label
+CALL_TAB_VPAD = 10  # taller than ttk's default, so the tab is an easier target to click
 THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
 TREE_THUMBNAIL_SIZE = (96, 52)  # previews in the image tab's table
 TREE_THUMBNAIL_ROW = 60
@@ -349,7 +352,23 @@ class ShinClipboardApp:
         self.call_snippet_list = snippet_page.listbox
         self.call_group_combo = snippet_page.combo
         self._setup_drag_source()
+        self._size_call_tabs()
         self.call_window.withdraw()
+
+    def _size_call_tabs(self) -> None:
+        """Even up the popup's tab widths and give them a taller click target.
+
+        ttk sizes each tab to its own label, so "色" (one character) ends up
+        far narrower than "定型文" and is harder to hit. The widest label sets
+        how much extra padding the others get to match it.
+        """
+        font = tkfont.nametofont("TkDefaultFont")
+        tab_ids = self.call_tabs.tabs()
+        widths = {tab_id: font.measure(self.call_tabs.tab(tab_id, "text")) for tab_id in tab_ids}
+        widest = max(widths.values(), default=0)
+        for tab_id, width in widths.items():
+            side = CALL_TAB_HPAD + (widest - width) // 2
+            self.call_tabs.tab(tab_id, padding=(side, CALL_TAB_VPAD, side, CALL_TAB_VPAD))
 
     def _build_call_page(self, title: str, groups_key: str, items_key: str, render, plain: bool = False) -> CallPage:
         """Add a grouped tab to the popup. `plain` rows are text only; the rest may carry pictures."""
