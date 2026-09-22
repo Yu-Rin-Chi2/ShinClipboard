@@ -1,6 +1,30 @@
 # ShinClipboard（シン・クリップボード）
 
+[![Buy Me A Coffee](https://img.shields.io/badge/-Buy%20Me%20A%20Coffee-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/yurinchi)
+
 Windows / macOS 向けの、クリップボード履歴・定型文・連続貼り付け管理アプリです。
+
+<p align="center">
+  <img src="docs/images/call-window-history.png" width="45%" alt="呼び出し画面：履歴・色・画像をキーひとつで貼り付け">
+  <img src="docs/images/settings-snippets.png" width="45%" alt="設定・編集画面：定型文をグループ分けして管理">
+</p>
+
+このアプリが気に入ったら、[Buy Me A Coffee](https://buymeacoffee.com/yurinchi) で開発を応援していただけると嬉しいです。
+
+## 目次
+
+- [主な機能](#主な機能)
+- [ダウンロード](#ダウンロード)
+- [使い方](#使い方)
+- [スクリーンショットと注釈](#スクリーンショットと注釈)
+- [テキスト整形](#テキスト整形)
+- [バックアップとCSV](#バックアップとcsv)
+- [他の端末への引き継ぎ](#他の端末への引き継ぎ)
+- [保存先](#保存先)
+- [配布版の実行について](#配布版の実行について)
+- [NewClipboardからの移行](#newclipboardからの移行)
+- [開発者向け情報](#開発者向け情報)
+- [ライセンス](#ライセンス)
 
 ## 主な機能
 
@@ -41,31 +65,11 @@ Windows版は[リリースページ](https://github.com/Yu-Rin-Chi2/ShinClipboar
 
 初回起動時にWindows SmartScreenの警告が出ます。回避手順は「[配布版の実行について](#配布版の実行について)」を参照してください。
 
-macOS版は同じリリースページの `ShinClipboard-macos.zip` です。展開して `ShinClipboard.app` を「アプリケーション」へ入れてください。ただし公証（notarization）を通していないため、ダウンロードしたままでは Gatekeeper に止められます。`xattr -dr com.apple.quarantine /Applications/ShinClipboard.app` を実行してから開いてください。気になる場合は下記の手順でソースから起動できます。
+macOS版は同じリリースページの `ShinClipboard-macos.zip` です。展開して `ShinClipboard.app` を「アプリケーション」へ入れてください。ただし公証（notarization）を通していないため、ダウンロードしたままでは Gatekeeper に止められます。`xattr -dr com.apple.quarantine /Applications/ShinClipboard.app` を実行してから開いてください。
 
-初回起動時にアクセシビリティの許可を求められます。詳しくは「[macOSの許可](#macosの許可)」を参照してください。
+初回起動時にアクセシビリティの許可を求められます。詳しくは下記の「macOSの許可」を参照してください。
 
-## ソースから起動
-
-Python 3.10以降を利用します。
-
-Windows:
-
-```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python main.py
-```
-
-macOS:
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python main.py
-```
-
-配布版のmacOSアプリは `ShinClipboard.app` です。ビルド方法は「テストと実行ファイル」を参照してください。
+Pythonの環境を用意してソースから起動したい場合は、[開発者向け情報](#開発者向け情報)を参照してください。
 
 ### macOSの許可
 
@@ -126,6 +130,8 @@ FIFO / LIFO切替、監視の一時停止が行えます。
 
 履歴の検索や複数選択は設定・編集画面の「履歴」タブで行います。ここでは選択項目の削除・全削除、テキストの編集、改行ごとの分割（「改行ごとに展開」）、複数項目の連結、画像の編集ができます。右クリックメニューからは、コピーした色コードを「色」タブへ、画像を「画像」タブへ登録できます。
 
+<p align="center"><img src="docs/images/settings-history.png" width="70%" alt="設定・編集画面の履歴タブ。色コードは[色]、画像は[画像]サイズ・ハッシュで表示される"></p>
+
 `#f00`、`#075dcc`、`#00000080` のような `#` で始まる色コードをコピーすると、呼び出し画面の履歴にはその色の見本が並び、設定・編集画面では `[色]` と表示されます。検索欄に「色」と入れると色コードだけを絞り込めます。`#` のない `075dcc` や `0x075dcc` は普通の文字列として扱います。
 
 ### 定型文を登録して貼り付ける
@@ -138,6 +144,8 @@ FIFO / LIFO切替、監視の一時停止が行えます。
 
 定型文とグループは `↑` / `↓` ボタンで並び替えられ、「定型文検索」欄で絞り込めます。CSVでの入出力は後述の「バックアップとCSV」を参照してください。
 
+<p align="center"><img src="docs/images/call-window-snippets.png" width="45%" alt="呼び出し画面の定型文タブ。グループを切り替えてキーひとつで貼り付け"></p>
+
 ### 色と画像を登録して貼り付ける
 
 定型文と同じ要領で、「色」タブと「画像」タブにもグループを作って登録します。
@@ -147,6 +155,15 @@ FIFO / LIFO切替、監視の一時停止が行えます。
 - 画像ファイルをエクスプローラー（Finder）から「画像」タブの表、または呼び出し画面の「画像」タブへドロップすると、ファイル名を名前にしてまとめて登録されます。名前やショートカットは後から「編集」で変えられます
 
 呼び出し画面では `Tab` で「色」「画像」タブへ切り替え、`←` / `→` でグループを選び、行頭のキーを押します。どちらもショートカット（例: `primary+alt+1`）を設定でき、設定した項目は呼び出し画面を開かずに貼り付けられます。
+
+<p align="center">
+  <img src="docs/images/settings-colors.png" width="45%" alt="設定・編集画面の色タブ">
+  <img src="docs/images/settings-images.png" width="45%" alt="設定・編集画面の画像タブ">
+</p>
+<p align="center">
+  <img src="docs/images/call-window-colors.png" width="45%" alt="呼び出し画面の色タブ">
+  <img src="docs/images/call-window-images.png" width="45%" alt="呼び出し画面の画像タブ">
+</p>
 
 登録した画像は保存先の `library/` に置かれ、設定JSONにはそのファイル名だけが入ります。別端末へ持っていくときは「全バックアップ」を使ってください（設定の書き出しだけでは画像ファイルは移りません）。
 
@@ -187,6 +204,8 @@ FIFO / LIFO切替、監視の一時停止が行えます。
 - 常に手前へ表示、最小化状態で起動、OSログイン時に起動
 - Ctrlキー2回で画面表示: オフにすると画面表示ショートカットのみで開きます
 - フォントサイズ、配色: 既定の `system` は macOS のライト／ダークモードに追従します（切り替えにもその場で追従）。`blue` `dark` `green` は固定の配色です。Windows では `system` は `blue` と同じです
+
+<p align="center"><img src="docs/images/settings-general.png" width="70%" alt="設定タブ：ショートカットや履歴保持件数などの設定項目"></p>
 
 ### グローバルショートカット一覧
 
@@ -249,6 +268,8 @@ FIFO / LIFO切替、監視の一時停止が行えます。
 | ぼかし / モザイク | ドラッグした範囲の見た目を崩す |
 | 切り抜き | ドラッグした範囲だけを残す。「切り抜き解除」でいつでも戻せる |
 
+<p align="center"><img src="docs/images/editor-annotations.png" width="70%" alt="注釈エディタ：矢印・矩形・文字を追加した例"></p>
+
 「フォント」には、この端末に入っている日本語が描けるフォントが並びます（PILは1文字ずつの代替ができないため、日本語を持たないフォントは出しません）。一覧は初回起動時にバックグラウンドで数秒かけて集め、`fonts.json` に記憶します。選んだフォントは既定として保存され、次回のエディタでもそのまま使われます。「選択」ツールで文字を選んでからフォントを変えると、その文字だけが変わります。
 
 | キー | 動作 |
@@ -296,6 +317,8 @@ macOSでは上記の `Ctrl` を `Cmd` に読み替えてください（`Ctrl` �
 正規表現の置換文字列では、Python互換の `\1` と、Cliborで使われる `$1` の両方を後方参照として利用できます。
 既定で「各行先頭に > を挿入」「各行先頭に // を挿入」「各行を引用符で囲む」「001: の連番を挿入」の4つが登録されています。
 
+<p align="center"><img src="docs/images/settings-transforms.png" width="70%" alt="整形タブ：テキスト整形ルールの一覧"></p>
+
 ## バックアップとCSV
 
 - JSON書き出し: 履歴を含めず、Windows / macOSで共有する設定・定型文・色・画像の一覧を保存（画像ファイル自体は含まない）
@@ -320,7 +343,7 @@ macOSでは上記の `Ctrl` を `Cmd` に読み替えてください（`Ctrl` �
 
 設定だけを軽く移したいときは同じ場所の「設定を書き出す／読み込む」（JSON）も使えます。こちらは全置き換えのみで、画像ファイルは含みません。
 
-クラウド同期フォルダの同一ファイルを直接使う場合は、次のように起動できます。
+クラウド同期フォルダの同一ファイルを直接使う場合は、次のように起動できます（`ShinClipboard.exe` に同じ引数を渡しても構いません）。
 
 ```powershell
 python main.py --config "D:\Sync\ShinClipboard\config.json"
@@ -329,55 +352,6 @@ python main.py --config "D:\Sync\ShinClipboard\config.json"
 ```bash
 python3 main.py --config "$HOME/Sync/ShinClipboard/config.json"
 ```
-
-## テストと実行ファイル
-
-テストは両OSで同じです。
-
-```bash
-python -m unittest discover -v
-```
-
-実行ファイルも同じspecからビルドします。ビルドするOSの実行ファイルだけが作られるので、Windows版はWindows上で、macOS版はmacOS上でビルドしてください。
-
-```bash
-python -m pip install pyinstaller
-python -m PyInstaller --clean ShinClipboard.spec
-```
-
-| OS | 生成物 | 形式 |
-|----|--------|------|
-| Windows | `dist/ShinClipboard.exe` | onefile（単体のexe） |
-| macOS | `dist/ShinClipboard.app` | アプリバンドル |
-
-macOSではonefileではなくバンドルにしています。起動が速いのに加えて、アクセシビリティと画面収録の許可はパスに紐づくため、
-起動のたびに自己展開する形式では毎回許可を求められてしまうからです。
-
-### macOSの署名
-
-macOSはアクセシビリティと画面収録の許可を**コード署名に対して**記録します。署名なし（ad-hoc）でビルドすると署名がバイナリのハッシュになるため、
-ビルドし直すたびに別のアプリ扱いになり、システム設定のトグルはONのままなのに許可が効かなくなります。
-
-そのためspecはビルド時にキーチェーンの署名用証明書を探し、見つかればそれで署名します。Apple Developer の
-「Apple Development」証明書があればそのまま使われ、再ビルドしても許可が維持されます。
-
-```bash
-security find-identity -v -p codesigning        # 使える証明書の一覧
-SHINCLIPBOARD_CODESIGN_IDENTITY="Apple Development: 名前 (TEAMID)" python -m PyInstaller --clean ShinClipboard.spec   # 明示する場合
-SHINCLIPBOARD_CODESIGN_IDENTITY=- python -m PyInstaller --clean ShinClipboard.spec   # ad-hoc に戻す場合
-```
-
-証明書がないときはad-hoc署名になり、ビルドのたびに許可の付け直し（トグルをOFF→ON）が必要です。
-署名の種類を切り替えた直後も一度だけ付け直してください。
-
-配布するときは `.app` をそのままzipせず、シンボリックリンクを保てる `ditto` を使ってください。
-
-```bash
-ditto -c -k --keepParent dist/ShinClipboard.app dist/ShinClipboard-mac.zip
-```
-
-アプリアイコンのソースは `assets/shinclipboard.png` です。Windows用は `assets/shinclipboard.ico`、macOS用は
-`assets/shinclipboard.icns` で、後者は `python tools/make_icns.py` で作り直せます（macOSのアイコングリッドに合わせて余白を入れます）。
 
 ## 保存先
 
@@ -423,7 +397,7 @@ xattr -dr com.apple.quarantine /Applications/ShinClipboard.app
 
 初回起動時にアクセシビリティと画面収録の許可を求めます。詳しくは「macOSの許可」を参照してください。
 証明書なし（ad-hoc署名）でビルドしたものは、ビルドし直すと別のアプリ扱いになり、システム設定のトグルがONのままでも許可が効かなくなります。
-その場合はトグルをOFF→ONにしてアプリを再起動してください。証明書で署名すれば再ビルドしても維持されます（「macOSの署名」を参照）。
+その場合はトグルをOFF→ONにしてアプリを再起動してください。証明書で署名すれば再ビルドしても維持されます（開発者向け情報の「macOSの署名」を参照）。
 
 アンインストールは `.app` を削除するだけです。設定と履歴は上記の「保存先」に、自動起動の登録は
 `~/Library/LaunchAgents/com.shinclipboard.app.plist` に残るので、必要なら合わせて削除してください。
@@ -436,6 +410,11 @@ xattr -dr com.apple.quarantine /Applications/ShinClipboard.app
 - OSの自動起動登録を新しい実行ファイルへ付け替え、旧登録を削除します
 
 旧バージョンで作成したZIPバックアップとCSVは、そのまま読み込めます。
+
+## 開発者向け情報
+
+ソースからの起動、テストの実行、実行ファイルのビルド、macOSのコード署名については
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) にまとめました。開発に参加する場合はそちらを参照してください。
 
 ## ライセンス
 
