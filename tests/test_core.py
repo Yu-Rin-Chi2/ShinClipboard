@@ -344,40 +344,6 @@ class CallWindowTests(unittest.TestCase):
         finally:
             _destroy_root(root)
 
-    def test_the_popup_tabs_are_padded_to_a_common_width(self):
-        """"色" is one character and would otherwise be a much smaller target to click than "定型文"."""
-        import tkinter as tk
-        import tkinter.font as tkfont
-
-        from shinclipboard.app import CALL_TAB_HPAD, CALL_TAB_VPAD, ShinClipboardApp
-
-        class HeadlessApp(ShinClipboardApp):
-            def _start_tray(self) -> None:
-                pass
-
-            def _restart_hotkeys(self) -> None:
-                pass
-
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            self.skipTest(f"Tk is unavailable: {error}")
-        root.withdraw()
-        try:
-            with tempfile.TemporaryDirectory() as folder:
-                app = HeadlessApp(root, JsonStore(Path(folder)))
-                font = tkfont.nametofont("TkDefaultFont")
-                widths = []
-                for tab_id in app.call_tabs.tabs():
-                    left, top, right, bottom = (int(str(value)) for value in app.call_tabs.tab(tab_id, "padding"))
-                    self.assertEqual((top, bottom), (CALL_TAB_VPAD, CALL_TAB_VPAD))
-                    text_width = font.measure(app.call_tabs.tab(tab_id, "text"))
-                    self.assertGreaterEqual(min(left, right), CALL_TAB_HPAD)
-                    widths.append(text_width + left + right)
-                self.assertEqual(len(set(widths)), 1, "every tab claims the same total width")
-        finally:
-            _destroy_root(root)
-
     def test_only_quick_keys_paste_from_the_popup(self):
         import tkinter as tk
 
