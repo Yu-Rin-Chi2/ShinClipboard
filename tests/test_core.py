@@ -349,7 +349,8 @@ class CallWindowTests(unittest.TestCase):
         import tkinter as tk
         import tkinter.font as tkfont
 
-        from shinclipboard.app import CALL_TAB_HPAD, CALL_TAB_VPAD, ShinClipboardApp
+        from shinclipboard.app import CALL_TAB_FONT_SIZE, CALL_TAB_HPAD, CALL_TAB_VPAD, ShinClipboardApp
+        from shinclipboard.platform_support import UI_FONT_FAMILY
 
         class HeadlessApp(ShinClipboardApp):
             def _start_tray(self) -> None:
@@ -366,7 +367,7 @@ class CallWindowTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as folder:
                 app = HeadlessApp(root, JsonStore(Path(folder)))
-                font = tkfont.nametofont("TkDefaultFont")
+                font = tkfont.Font(root, font=(UI_FONT_FAMILY, CALL_TAB_FONT_SIZE))
                 widths = []
                 for tab_id in app.call_tabs.tabs():
                     left, top, right, bottom = (int(str(value)) for value in app.call_tabs.tab(tab_id, "padding"))
@@ -374,7 +375,8 @@ class CallWindowTests(unittest.TestCase):
                     text_width = font.measure(app.call_tabs.tab(tab_id, "text"))
                     self.assertGreaterEqual(min(left, right), CALL_TAB_HPAD)
                     widths.append(text_width + left + right)
-                self.assertEqual(len(set(widths)), 1, "every tab claims the same total width")
+                # Off by at most the 1px that integer-dividing an odd gap can drop.
+                self.assertLessEqual(max(widths) - min(widths), 1, "every tab claims about the same total width")
         finally:
             _destroy_root(root)
 
