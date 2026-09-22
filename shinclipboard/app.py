@@ -88,9 +88,8 @@ CALL_WINDOW_HINT = (
     "Tab: 履歴/定型文/色/画像   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
     "Ctrl+E: 画像を編集   ドラッグ: 他アプリへ   Esc: 閉じる"
 )
-CALL_TAB_FONT_SIZE = 13  # noticeably larger than the ~9pt ttk default; padding alone read as barely different
-CALL_TAB_HPAD = 30  # minimum horizontal padding on each side of a popup tab's label
-CALL_TAB_VPAD = 14  # taller than ttk's default, so the tab is an easier target to click
+CALL_TAB_HPAD = 22  # minimum horizontal padding on each side of a popup tab's label
+CALL_TAB_VPAD = 10  # taller than ttk's default, so the tab is an easier target to click
 THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
 TREE_THUMBNAIL_SIZE = (96, 52)  # previews in the image tab's table
 TREE_THUMBNAIL_ROW = 60
@@ -331,10 +330,7 @@ class ShinClipboardApp:
         # does not fit on one line at every size or in every desktop's UI font.
         # Wrapping to the width it actually has beats clipping the last keys off.
         hint.bind("<Configure>", lambda event, label=hint: self._wrap_label(label, event.width))
-        # A style of its own: padding alone reads as barely different from ttk's
-        # default, so the label itself is set larger here too.
-        ttk.Style().configure("Call.TNotebook.Tab", font=(UI_FONT_FAMILY, CALL_TAB_FONT_SIZE))
-        self.call_tabs = ttk.Notebook(self.call_window, style="Call.TNotebook")
+        self.call_tabs = ttk.Notebook(self.call_window)
         self.call_tabs.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         history_frame = ttk.Frame(self.call_tabs, padding=2)
         self.call_tabs.add(history_frame, text="履歴")
@@ -366,7 +362,7 @@ class ShinClipboardApp:
         far narrower than "定型文" and is harder to hit. The widest label sets
         how much extra padding the others get to match it.
         """
-        font = tkfont.Font(self.call_window, font=(UI_FONT_FAMILY, CALL_TAB_FONT_SIZE))
+        font = tkfont.nametofont("TkDefaultFont")
         tab_ids = self.call_tabs.tabs()
         widths = {tab_id: font.measure(self.call_tabs.tab(tab_id, "text")) for tab_id in tab_ids}
         widest = max(widths.values(), default=0)
