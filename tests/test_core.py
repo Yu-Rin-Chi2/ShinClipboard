@@ -199,6 +199,10 @@ def _destroy_root(root) -> None:
     try:
         for timer in root.tk.splitlist(root.tk.call("after", "info")):
             root.tk.call("after", "cancel", timer)
+        # ttk queues its <<ThemeChanged>> broadcast as a C-level idle callback
+        # that `after info` cannot see; left pending, it fires against this
+        # destroyed window from the next root that runs the event loop.
+        root.update_idletasks()
     except Exception:
         pass
     root.destroy()
@@ -1031,8 +1035,11 @@ class ScreenshotAppTests(unittest.TestCase):
                 app = self._app(root, folder)
                 editor = app.open_editor(Image.new("RGB", (8, 8), "red"))
                 exported = resolve_font(24).getname()[0]
-                self.assertEqual(editor._font_family, exported, "Tk knows the exported face by this name")
-                self.assertEqual(editor._font(24)[0], exported)
+                # The preview name may carry the weight ("Yu Gothic Medium"), but
+                # it is the exported family, not the UI font.
+                self.assertTrue(editor._font_family.startswith(exported), (editor._font_family, exported))
+                self.assertTrue(editor_module.tk_knows_family(root, editor._font_family), "Tk knows the exported face by this name")
+                self.assertEqual(editor._font(24)[0], editor._font_family)
                 editor.close()
 
                 fake = unittest.mock.Mock()
@@ -1044,6 +1051,26 @@ class ScreenshotAppTests(unittest.TestCase):
                     )
         finally:
             _destroy_root(root)
+
+    def test_a_face_tk_lists_under_its_japanese_name_is_still_previewed_with_it(self):
+        """Japanese Windows reports "Yu Gothic" as "游ゴシック", and GDI files a Medium weight as its own family."""
+        from shinclipboard import editor as editor_module
+
+        known = {"yu gothic": "游ゴシック", "yu gothic medium": "游ゴシック Medium", "meiryo": "メイリオ"}
+
+        class FakeFont:
+            def __init__(self, master, font):
+                self.family = known.get(font[0].lower(), "ＭＳ Ｐゴシック")
+
+            def actual(self, option):
+                return self.family
+
+        with unittest.mock.patch.object(editor_module.tkfont, "Font", FakeFont):
+            self.assertTrue(editor_module.tk_knows_family(None, "Meiryo"))
+            self.assertFalse(editor_module.tk_knows_family(None, "Corporate Logo ver2"), "Tk's substitute is not a match")
+            self.assertEqual(editor_module.tk_family_for(None, "Yu Gothic", "Medium"), "Yu Gothic Medium")
+            self.assertEqual(editor_module.tk_family_for(None, "Yu Gothic", "Regular"), "Yu Gothic")
+            self.assertEqual(editor_module.tk_family_for(None, "Kaiso", "Next B"), "")
 
     def test_the_preview_places_text_where_the_export_draws_it(self):
         from shinclipboard.annotations import Shape, resolve_font, text_line_height

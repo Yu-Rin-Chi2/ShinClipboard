@@ -202,6 +202,10 @@ def _destroy_root(root) -> None:
     try:
         for timer in root.tk.splitlist(root.tk.call("after", "info")):
             root.tk.call("after", "cancel", timer)
+        # ttk's queued <<ThemeChanged>> broadcast is a C-level idle callback
+        # that `after info` cannot see; flushed here, or it fires against this
+        # destroyed window from the next root that runs the event loop.
+        root.update_idletasks()
     except Exception:
         pass
     root.destroy()

@@ -155,7 +155,6 @@ class ImageEditorWindow:
         self._drag_start: tuple[float, float] | None = None
         self._draft: Shape | None = None
         self._moving: Shape | None = None
-        self._dnd_path: Path | None = None
 
         self._offset = (0, 0)
         self._fitted = False
@@ -168,7 +167,7 @@ class ImageEditorWindow:
         self._text_box_color = self.color_var.get()
         self._text_box_font = ""
         self._font_family = preview_font_family(self.window)
-        self._tk_families: dict[str, bool] = {}  # catalog family -> whether Tk knows it too
+        self._tk_families: dict[str, str] = {}  # catalog family -> the name Tk draws it under, "" if none
         self._tk_fonts: dict[tuple[str, int], tkfont.Font] = {}  # by family and pixel size, for metrics
         self._font_menu_job: str | None = None
         self.font_size_var.trace_add("write", self._sync_text_box_style)
@@ -292,12 +291,6 @@ class ImageEditorWindow:
         ttk.Button(bar, text="クリップボードへコピー", command=self.copy_to_clipboard).pack(side="left")
         ttk.Button(bar, text="名前を付けて保存", command=self.save_as).pack(side="left", padx=6)
         ttk.Button(bar, text="履歴へ保存", command=self.save_to_history).pack(side="left")
-        # Dragging on the canvas draws, so the drag-out handle needs its own widget.
-        self.drag_handle = ttk.Label(
-            bar, text="⇱ ドラッグして渡す", relief="ridge", padding=(10, 4), cursor="hand2"
-        )
-        self.drag_handle.pack(side="left", padx=16)
-        self._setup_drag_source()
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
 
     def _bind_keys(self) -> None:
@@ -472,10 +465,13 @@ class ImageEditorWindow:
         """The Tk family for a catalog family, or the default face when Tk does not know it."""
         if not family:
             return self._font_family
-        known = self._tk_families.get(family)
-        if known is None:
-            known = self._tk_families[family] = tk_knows_family(self.window, family)
-        return family if known else self._font_family
+        name = self._tk_families.get(family)
+        if name is None:
+            face = CATALOG.face(family)
+            name = tk_family_for(self.window, family, face.style if face else "")
+            if face is not None:
+                self._tk_families[family] = name  # a miss before the scan finished must not stick
+        return name or self._font_family
 
     def _pixels(self, size: int) -> int:
         return max(1, int(round(size * self.zoom)))
@@ -987,23 +983,6 @@ class ImageEditorWindow:
         if not quiet:
             self._set_status(f"履歴へ保存しました（{width}×{height}）")
 
-    def _setup_drag_source(self) -> None:
-        if not getattr(self.app, "drag_enabled", False):
-            return
-        try:
-            self.drag_handle.drag_source_register(1, "DND_Files")
-            self.drag_handle.dnd_bind("<<DragInitCmd>>", self._drag_init)
-        except (AttributeError, tk.TclError):
-            self.drag_handle.configure(text="（ドラッグは利用できません）")
-
-    def _drag_init(self, _event=None):
-        """tkdnd <<DragInitCmd>>: hand the rendered picture over as a real file."""
-        try:
-            self._dnd_path = self._write_export()
-        except (OSError, ValueError):
-            return ("refuse_drop",)
-        return ("copy", "DND_Files", (str(self._dnd_path),))
-
     # ----- misc -------------------------------------------------------------------
 
     def _set_status(self, message: str) -> None:
@@ -1027,13 +1006,50 @@ def font_family(label: str) -> str:
     return "" if label in ("", DEFAULT_FONT_LABEL) else label
 
 
+# Styles Tk folds into a family's normal weight. Windows (GDI) files any other
+# weight as a family of its own, so "Yu Gothic" Medium is "Yu Gothic Medium".
+REGULAR_STYLES = frozenset({"", "regular", "normal", "book", "roman", "plain"})
+# A family no machine has, to learn what Tk substitutes for one it cannot find.
+_NO_SUCH_FAMILY = "ShinClipboard No Such Family"
+
+
 def tk_knows_family(master: tk.Misc, family: str) -> bool:
-    """Whether Tk can draw with this family: it silently substitutes a default for a
-    name it does not know, and `actual()` reports the substitute."""
+    """Whether Tk can draw with this family.
+
+    Tk silently substitutes a default for a name it does not know, and
+    `actual()` reports the substitute. A face it does know it may still report
+    under another name: Japanese Windows lists its fonts by their Japanese
+    names, so "Yu Gothic" comes back as "游ゴシック". A name is therefore
+    trusted when it is echoed, and otherwise when Tk did not fall back to the
+    substitute. (The substitute's own family is the one name this cannot
+    vouch for, and it only costs that family its preview.)
+    """
     try:
-        return str(tkfont.Font(master, font=(family, -24)).actual("family")).lower() == family.lower()
+        actual = _actual_family(master, family)
+        if actual.lower() == family.lower():
+            return True
+        return actual != _actual_family(master, _NO_SUCH_FAMILY)
     except tk.TclError:
         return False
+
+
+def _actual_family(master: tk.Misc, family: str) -> str:
+    return str(tkfont.Font(master, font=(family, -24)).actual("family"))
+
+
+def tk_family_for(master: tk.Misc, family: str, style: str = "") -> str:
+    """The name Tk draws a face under, or "" when Tk has no such face.
+
+    The GDI family ("Yu Gothic Medium") is tried before the family the file
+    declares, so that the preview keeps the weight the export is drawn with.
+    """
+    names = [family]
+    if style and style.lower() not in REGULAR_STYLES:
+        names.insert(0, f"{family} {style}")
+    for name in names:
+        if name and tk_knows_family(master, name):
+            return name
+    return ""
 
 
 def preview_font_family(master: tk.Misc) -> str:
@@ -1043,8 +1059,8 @@ def preview_font_family(master: tk.Misc) -> str:
     (and on macOS smaller kana) than the picture that is copied.
     """
     font = resolve_font(24)
-    family = font.getname()[0] if hasattr(font, "getname") else ""
-    return family if family and tk_knows_family(master, family) else UI_FONT_FAMILY
+    family, style = font.getname() if hasattr(font, "getname") else ("", "")
+    return (tk_family_for(master, family, style) if family else "") or UI_FONT_FAMILY
 
 
 def _pictures_dir() -> Path:

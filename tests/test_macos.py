@@ -268,21 +268,25 @@ class ClipboardImageTests(unittest.TestCase):
         self.assertEqual(image.size, (4, 4))
         grab.assert_called_once()
 
+    # The paths are made before `os.name` is patched: pathlib picks its flavour
+    # from it, and a PosixPath cannot be instantiated on Windows.
     def test_unreadable_image_does_not_clear_the_clipboard(self):
         appkit = Mock()
         appkit.NSData.dataWithContentsOfFile_.return_value = None
+        missing = Path("missing.png")
         with patch.dict(sys.modules, {"AppKit": appkit}), patch.object(clipboard_images.platform, "system", return_value="Darwin"), patch.object(clipboard_images.os, "name", "posix"):
             with self.assertRaises(OSError):
-                clipboard_images.write_clipboard_image(Path("missing.png"))
+                clipboard_images.write_clipboard_image(missing)
         appkit.NSPasteboard.generalPasteboard.assert_not_called()
 
     def test_rejected_image_write_is_reported(self):
         appkit = Mock()
         board = appkit.NSPasteboard.generalPasteboard.return_value
         board.setData_forType_.return_value = False
+        image = Path("image.png")
         with patch.dict(sys.modules, {"AppKit": appkit}), patch.object(clipboard_images.platform, "system", return_value="Darwin"), patch.object(clipboard_images.os, "name", "posix"):
             with self.assertRaises(OSError):
-                clipboard_images.write_clipboard_image(Path("image.png"))
+                clipboard_images.write_clipboard_image(image)
         board.changeCount.assert_not_called()
 
 
