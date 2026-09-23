@@ -4,6 +4,8 @@ pystray>=0.19.5,<1
 Pillow>=10,<12
 tkinterdnd2>=0.4,<1
 pywin32>=306; sys_platform == "win32"
+# The Windows 11 look for the ttk widgets; macOS keeps its native Aqua theme.
+sv-ttk>=2.6,<3; sys_platform == "win32"
 # pynput and pystray pull most of these in already, but the app calls them
 # directly - AppKit for the image clipboard, Quartz for the screen grab and the
 # paste keystroke, ApplicationServices for the Accessibility check - so they are

@@ -188,8 +188,8 @@ class GroupPanel(ttk.Frame):
         bar.add(ttk.Button(bar, text="追加", command=self.add))
         bar.add(ttk.Button(bar, text="名前変更", command=self.rename))
         bar.add(ttk.Button(bar, text="削除", command=self.delete))
-        bar.add(ttk.Button(bar, text="↑", width=3, command=lambda: self.move(-1)), gap=4)
-        bar.add(ttk.Button(bar, text="↓", width=3, command=lambda: self.move(1)), together=True)
+        bar.add(ttk.Button(bar, text="▲", width=3, command=lambda: self.move(-1)), gap=4)
+        bar.add(ttk.Button(bar, text="▼", width=3, command=lambda: self.move(1)), together=True)
 
     def selected_index(self) -> int | None:
         selected = self.listbox.curselection()
@@ -263,9 +263,7 @@ class ScrollableFrame(ttk.Frame):
     def __init__(self, master=None, **kwargs):
         super().__init__(master)
         self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, takefocus=0)
-        background = ttk.Style().lookup("TFrame", "background")
-        if background:
-            self._canvas.configure(background=background)
+        self.repaint()
         self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
         self._canvas.pack(side="left", fill="both", expand=True)
@@ -280,6 +278,12 @@ class ScrollableFrame(ttk.Frame):
         # swallowing the scrolling of every other window in the app.
         self._canvas.bind("<Enter>", lambda _: self._bind_wheel())
         self._canvas.bind("<Leave>", lambda _: self._unbind_wheel())
+
+    def repaint(self) -> None:
+        """Take the frame colour of the current ttk theme, which changes with light / dark."""
+        background = ttk.Style().lookup("TFrame", "background")
+        if background:
+            self._canvas.configure(background=background)
 
     def _on_body_configure(self, _event=None) -> None:
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))

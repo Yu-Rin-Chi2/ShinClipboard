@@ -26,6 +26,7 @@ from .annotations import (
 from .fonts import CATALOG
 from .icons import tool_icon
 from .platform_support import IS_MAC, UI_FONT_FAMILY
+from .theme import THEMES, is_dark
 
 
 # Tool id -> (button label, tooltip-ish hint shown in the status bar).
@@ -50,7 +51,7 @@ MIN_ZOOM = 0.1
 MAX_ZOOM = 8.0
 EXPORT_DIR = "exports"
 EXPORT_MAX_AGE = 24 * 60 * 60
-TOOL_SELECTED_BG = "#bfdbfe"
+TOOL_INK = {"light": "#1f2937", "dark": "#e5e7eb"}  # tool glyph colour per theme mode
 SWATCH_SIZE = 20  # pixels per colour swatch, selection ring not included
 # The Text widget's own bindings speak Command on macOS, so the shortcuts
 # offered next to them do too.
@@ -65,9 +66,10 @@ FONT_MENU_POLL_MS = 500  # how often the menu looks for the background font scan
 class _Tooltip:
     """Small hover label for icon-only buttons."""
 
-    def __init__(self, widget: tk.Misc, text: str, delay_ms: int = 450):
+    def __init__(self, widget: tk.Misc, text: str, palette=lambda: THEMES["blue"], delay_ms: int = 450):
         self.widget = widget
         self.text = text
+        self.palette = palette  # read when shown, so a theme switch needs no rebuild
         self.delay_ms = delay_ms
         self._job: str | None = None
         self._tip: tk.Toplevel | None = None
@@ -86,9 +88,11 @@ class _Tooltip:
         tip = tk.Toplevel(self.widget)
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
+        colors = self.palette()
         tk.Label(
-            tip, text=self.text, background="#fefce8", foreground="#1f2937",
-            relief="solid", borderwidth=1, padx=6, pady=3, font=(UI_FONT_FAMILY, 9),
+            tip, text=self.text, background=colors["tooltip"], foreground=colors["foreground"],
+            highlightthickness=1, highlightbackground=colors["border"], borderwidth=0,
+            padx=8, pady=4, font=(UI_FONT_FAMILY, 9),
         ).pack()
         x = self.widget.winfo_rootx()
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
@@ -139,6 +143,7 @@ class ImageEditorWindow:
         self.window.minsize(640, 480)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
+        self._colors = app._theme_colors()
         settings = app.config["settings"]
         self.tool_var = tk.StringVar(value="arrow")
         self.color_var = tk.StringVar(value=str(settings.get("annotation_color", PALETTE[0])))
@@ -186,32 +191,35 @@ class ImageEditorWindow:
     # ----- construction -----------------------------------------------------------
 
     def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self.window, padding=(10, 8, 10, 4))
+        bar = ttk.Frame(self.window, padding=(12, 10, 12, 6))
         bar.pack(fill="x")
         tools = ttk.Frame(bar)
         tools.pack(side="left")
         self._icons: dict[str, ImageTk.PhotoImage] = {}  # Tk drops images nobody references
+        self._tool_buttons: list[tk.Radiobutton] = []
         for name, label, hint in TOOLS:
-            self._icons[name] = ImageTk.PhotoImage(tool_icon(name), master=self.window)
+            # Flat tiles that light up under the pointer and stay tinted while
+            # chosen, the way a Windows 11 toolbar marks its current tool.
             button = tk.Radiobutton(
                 tools,
-                image=self._icons[name],
                 value=name,
                 variable=self.tool_var,
                 command=self._tool_changed,
                 indicatoron=False,
-                selectcolor=TOOL_SELECTED_BG,
                 relief="flat",
-                overrelief="raised",
-                borderwidth=1,
-                padx=5,
-                pady=3,
+                overrelief="flat",
+                borderwidth=0,
+                highlightthickness=0,
+                padx=7,
+                pady=5,
                 cursor="hand2",
             )
             button.pack(side="left", padx=1)
-            _Tooltip(button, f"{label}　{hint}")
+            self._tool_buttons.append(button)
+            _Tooltip(button, f"{label}　{hint}", palette=lambda: self._colors)
+        self._paint_tools()
 
-        options = ttk.Frame(self.window, padding=(10, 0, 10, 6))
+        options = ttk.Frame(self.window, padding=(12, 0, 12, 8))
         options.pack(fill="x")
         ttk.Label(options, text="色").pack(side="left", padx=(0, 4))
         self.swatches = ttk.Frame(options)
@@ -227,11 +235,13 @@ class ImageEditorWindow:
                 height=SWATCH_SIZE,
                 highlightthickness=2,
                 highlightbackground=color,
+                borderwidth=0,
                 cursor="hand2",
             )
             swatch.pack(side="left", padx=1)
             swatch.bind("<Button-1>", lambda _event, value=color: self._pick_color(value))
-        ttk.Button(options, text="…", width=3, command=self._choose_color).pack(side="left", padx=(4, 12))
+        ttk.Button(options, text="…", width=3, command=self._choose_color).pack(side="left", padx=(6, 0))
+        ttk.Separator(options, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
         ttk.Label(options, text="太さ").pack(side="left")
         ttk.Spinbox(options, from_=1, to=40, width=4, textvariable=self.width_var).pack(side="left", padx=(4, 12))
         ttk.Label(options, text="文字サイズ").pack(side="left")
@@ -242,7 +252,8 @@ class ImageEditorWindow:
         self.font_combo = ttk.Combobox(
             options, textvariable=self.font_var, state="readonly", width=22, postcommand=self._fill_font_menu
         )
-        self.font_combo.pack(side="left", padx=(4, 12))
+        self.font_combo.pack(side="left", padx=(4, 0))
+        ttk.Separator(options, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
         self.font_combo.bind("<<ComboboxSelected>>", self._font_chosen)
         self._fill_font_menu()
         ttk.Checkbutton(options, text="塗りつぶし", variable=self.filled_var).pack(side="left")
@@ -250,7 +261,7 @@ class ImageEditorWindow:
         # What is drawn goes above, what is done to the picture goes here. One
         # row held both until macOS, where the same widgets are wide enough that
         # the buttons at the end fall off the window without any sign of it.
-        view = ttk.Frame(self.window, padding=(10, 0, 10, 6))
+        view = ttk.Frame(self.window, padding=(12, 0, 12, 8))
         view.pack(fill="x")
         ttk.Button(view, text="取り消し", command=self.undo).pack(side="right")
         ttk.Button(view, text="やり直し", command=self.redo).pack(side="right", padx=6)
@@ -266,8 +277,8 @@ class ImageEditorWindow:
 
     def _build_canvas(self) -> None:
         frame = ttk.Frame(self.window)
-        frame.pack(fill="both", expand=True, padx=10)
-        self.canvas = tk.Canvas(frame, background="#3f3f46", highlightthickness=0, cursor="crosshair")
+        frame.pack(fill="both", expand=True, padx=12)
+        self.canvas = tk.Canvas(frame, background=self._colors["canvas"], highlightthickness=0, cursor="crosshair")
         vertical = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
         horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -286,9 +297,9 @@ class ImageEditorWindow:
         self.canvas.bind("<MouseWheel>", lambda event: self.canvas.yview_scroll(-int(event.delta / 120), "units"))
 
     def _build_actions(self) -> None:
-        bar = ttk.Frame(self.window, padding=(10, 8))
+        bar = ttk.Frame(self.window, padding=(12, 10))
         bar.pack(fill="x")
-        ttk.Button(bar, text="クリップボードへコピー", command=self.copy_to_clipboard).pack(side="left")
+        ttk.Button(bar, text="クリップボードへコピー", style="Accent.TButton", command=self.copy_to_clipboard).pack(side="left")
         ttk.Button(bar, text="名前を付けて保存", command=self.save_as).pack(side="left", padx=6)
         ttk.Button(bar, text="履歴へ保存", command=self.save_to_history).pack(side="left")
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
@@ -851,7 +862,34 @@ class ImageEditorWindow:
     def _paint_swatches(self) -> None:
         current = self.color_var.get()
         for child, color in zip(self.swatches.winfo_children(), PALETTE):
-            child.configure(highlightbackground="#111827" if color == current else color)
+            # Every swatch is outlined, or the near-black one vanishes into a
+            # dark toolbar; the chosen one gets the text colour instead.
+            child.configure(highlightbackground=self._colors["foreground"] if color == current else self._colors["swatch_ring"])
+
+    def _paint_tools(self) -> None:
+        colors = self._colors
+        mode = "dark" if is_dark(colors) else "light"
+        for button, (name, _label, _hint) in zip(self._tool_buttons, TOOLS):
+            # The badge's numeral is white, so on a dark bar the disc takes the
+            # accent rather than a pale ink it would vanish into.
+            ink = colors["accent"] if name == "number" and mode == "dark" else TOOL_INK[mode]
+            self._icons[name] = ImageTk.PhotoImage(tool_icon(name, ink=ink), master=self.window)
+            button.configure(
+                image=self._icons[name],
+                background=colors["window"],
+                activebackground=colors["tool_hover"],
+                selectcolor=colors["tool_selected"],
+            )
+
+    def apply_theme(self, colors: dict[str, str]) -> None:
+        """Repaint the plain Tk parts after the app switched between light and dark."""
+        self._colors = colors
+        try:
+            self._paint_tools()
+            self._paint_swatches()
+            self.canvas.configure(background=colors["canvas"])
+        except tk.TclError:
+            pass  # the window is on its way out
 
     def undo(self) -> str:
         if self._text_box is not None:

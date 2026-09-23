@@ -669,10 +669,17 @@ class AppearanceTests(unittest.TestCase):
                     app._apply_appearance()
                     self.assertEqual(str(app.history_list.cget("background")), "#ffffff", "a named theme is fixed")
                     self.assertEqual(str(app.root.cget("background")), "systemWindowBackgroundColor")
-                with unittest.mock.patch("shinclipboard.app.IS_MAC", False):
+                with unittest.mock.patch("shinclipboard.app.IS_MAC", False), unittest.mock.patch(
+                    "shinclipboard.app.windows_dark_mode", return_value=False
+                ):
                     app = self._app(root, folder)
-                    self.assertEqual(str(app.root.cget("background")), "#ffffff", "system means blue off macOS")
+                    self.assertEqual(str(app.root.cget("background")), THEMES["blue"]["window"], "light Windows means blue")
                     self.assertEqual(str(app.history_list.cget("background")), "#ffffff")
+                with unittest.mock.patch("shinclipboard.app.IS_MAC", False), unittest.mock.patch(
+                    "shinclipboard.app.windows_dark_mode", return_value=True
+                ):
+                    app = self._app(root, folder)
+                    self.assertEqual(str(app.history_list.cget("background")), THEMES["dark"]["background"])
         finally:
             _destroy_root(root)
 
