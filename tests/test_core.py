@@ -798,6 +798,42 @@ class ScreenshotAppTests(unittest.TestCase):
         finally:
             _destroy_root(root)
 
+    def test_the_toolbar_restyles_the_selected_shape_in_one_undo_step(self):
+        from shinclipboard.annotations import Shape
+        from shinclipboard.editor import ImageEditorWindow
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = ImageEditorWindow(app, Image.new("RGB", (60, 40), "white"))
+                arrow = Shape("arrow", [(2, 2), (30, 20)], width=4)
+                box = Shape("rect", [(5, 5), (20, 20)], width=4)
+                editor.document.shapes += [arrow, box]
+
+                editor.selected_id = arrow.id
+                editor._show_shape_style(arrow)
+                self.assertEqual(editor.width_var.get(), "4", "selecting shows the shape's own width")
+                self.assertEqual(len(editor.history._undo), 0, "and showing it changes nothing")
+                for width in ("5", "6", "9"):  # three clicks on the spinbox arrow
+                    editor.width_var.set(width)
+                self.assertEqual(arrow.width, 9)
+                self.assertEqual(box.width, 4, "only the selected shape changes")
+                editor.undo()
+                self.assertEqual(editor.document.find(arrow.id).width, 4, "one undo takes back the whole run")
+
+                editor.selected_id = box.id
+                editor._show_shape_style(box)
+                editor.filled_var.set(True)
+                self.assertTrue(editor.document.find(box.id).filled)
+
+                editor.selected_id = None
+                editor.width_var.set("12")
+                self.assertEqual(editor.document.find(arrow.id).width, 4, "with nothing selected only new shapes change")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
     def test_a_text_history_row_is_refused_by_the_image_editor(self):
         opened: list[str] = []
         root = self._root()

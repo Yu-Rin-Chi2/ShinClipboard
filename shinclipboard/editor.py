@@ -46,6 +46,10 @@ TOOLS: tuple[tuple[str, str, str], ...] = (
 
 DRAG_TOOLS = {"arrow", "rect", "ellipse", "highlight", "blur", "pixelate", "crop"}
 CLICK_TOOLS = {"text", "number"}
+# Which shapes each toolbar setting means something for, once drawn.
+WIDTH_KINDS = {"arrow", "rect", "ellipse", "freehand", "highlight"}
+FILLABLE_KINDS = {"rect", "ellipse"}
+FONT_SIZE_KINDS = {"text", "number"}
 
 MIN_ZOOM = 0.1
 MAX_ZOOM = 8.0
@@ -178,6 +182,12 @@ class ImageEditorWindow:
         self.font_size_var.trace_add("write", self._sync_text_box_style)
         self.color_var.trace_add("write", self._sync_text_box_style)
         self.font_var.trace_add("write", self._sync_text_box_style)
+        # The toolbar also restyles the selected shape, not just the next one.
+        self._showing_shape = False  # set while the toolbar is being filled from a shape
+        self._style_edit: tuple[str, str] | None = None  # (shape id, property) of the last restyle
+        self.width_var.trace_add("write", self._width_changed)
+        self.filled_var.trace_add("write", self._filled_changed)
+        self.font_size_var.trace_add("write", self._font_size_changed)
 
         self._build_toolbar()
         self._build_canvas()
@@ -532,6 +542,7 @@ class ImageEditorWindow:
             if self.tool_var.get() == "text":
                 return  # one click closes the box; the next one opens a new box
         self.window.focus_set()
+        self._style_edit = None
         x, y = self._to_image(event.x, event.y)
         self._drag_start = (x, y)
         tool = self.tool_var.get()
@@ -541,6 +552,7 @@ class ImageEditorWindow:
             self._moving = shape
             if shape is not None:
                 self.history.push(self.document)
+                self._show_shape_style(shape)
             self._paint_selection()
             return
         if tool in CLICK_TOOLS:
@@ -608,6 +620,9 @@ class ImageEditorWindow:
             return
         self.history.push(self.document)
         self.document.shapes.append(draft)
+        # The new shape stays selected, so the toolbar can still adjust it -
+        # a thicker arrow is usually wanted right after seeing the first one.
+        self.selected_id = draft.id
         self.refresh(rebuild_raster=draft.kind in RASTER_KINDS)
 
     def _draw_draft(self) -> None:
@@ -642,6 +657,7 @@ class ImageEditorWindow:
             shape = self._new_shape("number", [(x, y)])
             shape.number = self.document.next_number()
             self.document.shapes.append(shape)
+            self.selected_id = shape.id
             self.refresh()
             return
         self._open_text_box(x, y)
@@ -818,11 +834,72 @@ class ImageEditorWindow:
     def _pick_color(self, color: str) -> None:
         self.color_var.set(color)
         self._paint_swatches()
-        shape = self.document.find(self.selected_id) if self.selected_id else None
-        if shape is not None:
+        self._restyle_selected("color", {"color": color})
+
+    def _show_shape_style(self, shape: Shape) -> None:
+        """Fill the toolbar with a just-selected shape's own style, without restyling it."""
+        self._showing_shape = True
+        try:
+            self.color_var.set(shape.color)
+            if shape.kind in ("blur", "pixelate") or shape.kind in WIDTH_KINDS:
+                self.width_var.set(str(shape.width))
+            if shape.kind in FILLABLE_KINDS:
+                self.filled_var.set(shape.filled)
+            if shape.kind in FONT_SIZE_KINDS:
+                self.font_size_var.set(str(shape.font_size))
+        finally:
+            self._showing_shape = False
+        self._paint_swatches()
+
+    def _restyle_selected(self, prop: str, values: dict) -> None:
+        """Set `values` on the selected shape, as one undo step per run of edits.
+
+        Clicking a spinbox arrow five times is one adjustment, so edits of the
+        same property of the same shape share the step the first one pushed;
+        a click on the canvas, or an edit of anything else, starts a new one.
+        """
+        if self._showing_shape or not self.selected_id or not values:
+            return
+        shape = self.document.find(self.selected_id)
+        if shape is None or all(getattr(shape, name) == value for name, value in values.items()):
+            return
+        key = (shape.id, prop)
+        if self._style_edit != key:
             self.history.push(self.document)
-            shape.color = color
-            self.refresh(rebuild_raster=shape.kind in RASTER_KINDS)
+            self._style_edit = key
+        for name, value in values.items():
+            setattr(shape, name, value)
+        self.refresh(rebuild_raster=shape.kind in RASTER_KINDS)
+
+    def _selected_kind(self) -> str | None:
+        shape = self.document.find(self.selected_id) if self.selected_id else None
+        return shape.kind if shape is not None else None
+
+    def _width_changed(self, *_args) -> None:
+        try:
+            width = max(1, min(40, int(self.width_var.get())))
+        except (TypeError, ValueError):
+            return  # half-typed in the spinbox
+        kind = self._selected_kind()
+        if kind in ("blur", "pixelate"):
+            # For the effects the toolbar's width is their strength, as when drawn.
+            self._restyle_selected("width", {"width": width, "strength": max(effective_pixel_block(0), width * 3)})
+        elif kind in WIDTH_KINDS:
+            self._restyle_selected("width", {"width": width})
+
+    def _filled_changed(self, *_args) -> None:
+        if self._selected_kind() in FILLABLE_KINDS:
+            self._restyle_selected("filled", {"filled": bool(self.filled_var.get())})
+
+    def _font_size_changed(self, *_args) -> None:
+        if self._text_box is not None:
+            return  # the open box takes the size, and hands it on when committed
+        try:
+            size = max(8, min(200, int(self.font_size_var.get())))
+        except (TypeError, ValueError):
+            return
+        if self._selected_kind() in FONT_SIZE_KINDS:
+            self._restyle_selected("font_size", {"font_size": size})
 
     def _chosen_font(self) -> str:
         return font_family(self.font_var.get())

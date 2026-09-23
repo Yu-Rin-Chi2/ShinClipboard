@@ -19,6 +19,7 @@ import pyperclip
 from PIL import Image, ImageTk
 
 from .capture_overlay import RegionSelector
+from . import ocr
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .colors import normalize_hex_color, parse_hex_color, swatch_image
 from .core import FifoQueue, HistoryItem
@@ -149,6 +150,7 @@ class ShinClipboardApp:
         self.events: queue.Queue[tuple[str, object | None]] = queue.Queue()
         self.hotkeys: GlobalHotkeyService | None = None
         self.tray = None
+        self.ocr_running = False
         self.closing = False
         self.editors: set[ImageEditorWindow] = set()
         self.capturing = False
@@ -891,6 +893,10 @@ class ShinClipboardApp:
                     self.start_delayed_capture()
                 elif event == "edit_clipboard_image":
                     self.edit_clipboard_image()
+                elif event == "ocr_clipboard_image":
+                    self.ocr_clipboard_image()
+                elif event == "ocr_done":
+                    self._ocr_done(*payload)
                 elif event == "quit":
                     self.quit()
                     return
@@ -2879,6 +2885,47 @@ class ShinClipboardApp:
             return
         self.open_editor(image, "クリップボードの画像")
 
+    def ocr_clipboard_image(self) -> None:
+        """Replace the image on the clipboard with the text read from it.
+
+        Recognition takes a moment on a large screenshot, so it runs on a worker
+        and the answer comes back through the event queue as "ocr_done".
+        """
+        if self.ocr_running:
+            self._notify("OCR を実行中です")
+            return
+        image = read_clipboard_image()
+        if image is None:
+            self._notify("クリップボードに画像がありません")
+            return
+        self.ocr_running = True
+        self.status_var.set("OCR を実行中…")
+
+        def work() -> None:
+            try:
+                self.events.put(("ocr_done", (True, ocr.recognize(image))))
+            except ocr.OcrError as error:
+                self.events.put(("ocr_done", (False, str(error))))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ocr_done(self, ok: bool, result: str) -> None:
+        self.ocr_running = False
+        if not ok:
+            self._notify(result)
+            return
+        self._set_clipboard(result)
+        self._notify(f"OCR の結果（{len(result)}文字）をクリップボードにコピーしました")
+
+    def _notify(self, message: str) -> None:
+        """Tell the user, even when the only window they can see is the tray icon."""
+        self.status_var.set(message)
+        if self.tray is not None:
+            try:
+                self.tray.notify(message, "ShinClipboard")
+            except Exception:
+                pass  # a backend without notifications still has the status bar
+
     def _edit_image_item(self, item, parent: tk.Misc | None = None) -> None:
         if item is None or item.kind != "image":
             messagebox.showinfo("画像編集", "画像の履歴を選んでください。", parent=parent or self.root)
@@ -2952,6 +2999,11 @@ class ShinClipboardApp:
                 pystray.MenuItem("スクリーンショットを撮る", lambda *_: self.events.put(("screenshot", None))),
                 pystray.MenuItem("数秒後にスクリーンショットを撮る", lambda *_: self.events.put(("screenshot_delayed", None))),
                 pystray.MenuItem("クリップボードの画像を編集", lambda *_: self.events.put(("edit_clipboard_image", None))),
+                pystray.MenuItem(
+                    "クリップボードの画像を OCR",
+                    lambda *_: self.events.put(("ocr_clipboard_image", None)),
+                    visible=ocr.is_available(),
+                ),
                 pystray.MenuItem("FIFO 切替", lambda *_: self.events.put(("toggle_fifo", None))),
                 pystray.MenuItem("LIFO 切替", lambda *_: self.events.put(("toggle_lifo", None))),
                 pystray.MenuItem("クリップボード監視 切替", lambda *_: self.events.put(("toggle_monitor", None))),

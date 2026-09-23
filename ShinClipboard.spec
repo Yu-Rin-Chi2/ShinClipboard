@@ -128,6 +128,14 @@ if IS_MAC:
     # The tray and the hotkeys pick their backend at run time, so nothing in the
     # source tree names these modules for PyInstaller to follow.
     hidden_imports += ["pystray._darwin", "pynput.keyboard._darwin", "pynput.mouse._darwin"]
+if IS_WINDOWS:
+    # The OCR result's collections and the recogniser's Language are projected by
+    # the WinRT runtime on demand, not imported by anything PyInstaller can see.
+    hidden_imports += [
+        "winrt.windows.foundation",
+        "winrt.windows.foundation.collections",
+        "winrt.windows.globalization",
+    ]
 
 datas = [("assets", "assets")]
 if IS_WINDOWS:
