@@ -44,6 +44,7 @@ def default_config() -> dict[str, Any]:
             # suppress the keys it watches, so both would fire. Alt keeps clear.
             "screenshot_hotkey": "primary+alt+s",
             "screenshot_delay_hotkey": "primary+alt+d",
+            "screenshot_ocr_hotkey": "primary+alt+o",  # pick a region, copy its text (Windows only)
             "screenshot_delay_seconds": 3,
             "screenshot_save_dir": "",
             "screenshot_format": "png",

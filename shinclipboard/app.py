@@ -151,6 +151,7 @@ class ShinClipboardApp:
         self.hotkeys: GlobalHotkeyService | None = None
         self.tray = None
         self.ocr_running = False
+        self._capture_for_ocr = False  # the region being picked is to be read, not edited
         self.closing = False
         self.editors: set[ImageEditorWindow] = set()
         self.capturing = False
@@ -187,6 +188,7 @@ class ShinClipboardApp:
         self.monitor_status_var.set("監視中")
         self.screenshot_hotkey_var = tk.StringVar()
         self.screenshot_delay_hotkey_var = tk.StringVar()
+        self.screenshot_ocr_hotkey_var = tk.StringVar()
         self.screenshot_delay_var = tk.StringVar()
         self.screenshot_dir_var = tk.StringVar()
         self.screenshot_format_var = tk.StringVar()
@@ -650,25 +652,29 @@ class ShinClipboardApp:
         ttk.Entry(delay_row, textvariable=self.screenshot_delay_hotkey_var, width=24).pack(side="left")
         ttk.Label(delay_row, text="秒数").pack(side="left", padx=(12, 4))
         ttk.Spinbox(delay_row, from_=1, to=60, textvariable=self.screenshot_delay_var, width=5).pack(side="left")
-        ttk.Label(shots, text="既定の保存先（空欄でピクチャ）").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
-        ttk.Entry(shots, textvariable=self.screenshot_dir_var, width=40).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Button(shots, text="選ぶ", command=self._choose_screenshot_dir).grid(row=2, column=2, sticky="w", padx=6)
-        ttk.Label(shots, text="既定の形式").grid(row=3, column=0, sticky="w", padx=(0, 14), pady=4)
+        # Only where OCR can run; elsewhere the row would promise a shortcut that does nothing.
+        if ocr.is_available():
+            ttk.Label(shots, text="範囲を選んで文字をコピー（OCR）").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
+            ttk.Entry(shots, textvariable=self.screenshot_ocr_hotkey_var, width=24).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(shots, text="既定の保存先（空欄でピクチャ）").grid(row=3, column=0, sticky="w", padx=(0, 14), pady=4)
+        ttk.Entry(shots, textvariable=self.screenshot_dir_var, width=40).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Button(shots, text="選ぶ", command=self._choose_screenshot_dir).grid(row=3, column=2, sticky="w", padx=6)
+        ttk.Label(shots, text="既定の形式").grid(row=4, column=0, sticky="w", padx=(0, 14), pady=4)
         ttk.Combobox(
             shots, textvariable=self.screenshot_format_var, values=["png", "jpeg"], state="readonly", width=10
-        ).grid(row=3, column=1, sticky="w", pady=4)
+        ).grid(row=4, column=1, sticky="w", pady=4)
         ttk.Checkbutton(shots, text="保存後にクリップボードへもコピー", variable=self.screenshot_copy_var).grid(
-            row=4, column=0, sticky="w", pady=3
+            row=5, column=0, sticky="w", pady=3
         )
         ttk.Checkbutton(shots, text="コピーした編集結果を履歴へ残す", variable=self.screenshot_history_var).grid(
-            row=4, column=1, sticky="w", pady=3
+            row=5, column=1, sticky="w", pady=3
         )
         builtin = "macOS標準の Cmd+Shift+4" if IS_MAC else "Windows標準の Win+Shift+S"
         ttk.Label(
             shots,
             text=f"{builtin} とは別の機能です。ディレイ撮影はメニューやツールチップを開いてから写すときに使います。",
             style="Muted.TLabel",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         portability = ttk.LabelFrame(self.settings_tab, text="CSV・バックアップ", padding=12)
         portability.pack(fill="x")
@@ -891,6 +897,8 @@ class ShinClipboardApp:
                     self.start_capture()
                 elif event == "screenshot_delayed":
                     self.start_delayed_capture()
+                elif event == "screenshot_ocr":
+                    self.start_ocr_capture()
                 elif event == "edit_clipboard_image":
                     self.edit_clipboard_image()
                 elif event == "ocr_clipboard_image":
@@ -2393,6 +2401,7 @@ class ShinClipboardApp:
         self.double_ctrl_var.set(settings.get("double_ctrl_popup", True))
         self.screenshot_hotkey_var.set(settings.get("screenshot_hotkey", ""))
         self.screenshot_delay_hotkey_var.set(settings.get("screenshot_delay_hotkey", ""))
+        self.screenshot_ocr_hotkey_var.set(settings.get("screenshot_ocr_hotkey", ""))
         self.screenshot_delay_var.set(str(settings.get("screenshot_delay_seconds", 3)))
         self.screenshot_dir_var.set(settings.get("screenshot_save_dir", ""))
         self.screenshot_format_var.set(settings.get("screenshot_format", "png"))
@@ -2428,6 +2437,7 @@ class ShinClipboardApp:
         settings["double_ctrl_popup"] = self.double_ctrl_var.get()
         settings["screenshot_hotkey"] = self.screenshot_hotkey_var.get().strip().lower()
         settings["screenshot_delay_hotkey"] = self.screenshot_delay_hotkey_var.get().strip().lower()
+        settings["screenshot_ocr_hotkey"] = self.screenshot_ocr_hotkey_var.get().strip().lower()
         try:
             settings["screenshot_delay_seconds"] = max(1, min(60, int(self.screenshot_delay_var.get())))
         except ValueError:
@@ -2469,6 +2479,8 @@ class ShinClipboardApp:
             mappings[settings["screenshot_hotkey"]] = lambda: self.events.put(("screenshot", None))
         if str(settings.get("screenshot_delay_hotkey", "")).strip():
             mappings[settings["screenshot_delay_hotkey"]] = lambda: self.events.put(("screenshot_delayed", None))
+        if str(settings.get("screenshot_ocr_hotkey", "")).strip() and ocr.is_available():
+            mappings[settings["screenshot_ocr_hotkey"]] = lambda: self.events.put(("screenshot_ocr", None))
         for group in self.config["groups"]:
             for snippet in group.get("snippets", []):
                 if snippet.get("hotkey"):
@@ -2511,6 +2523,11 @@ class ShinClipboardApp:
         widgets = [getattr(self, name, None) for name in ("history_list", "group_list", "fifo_list", "call_history_list")]
         widgets += [panel.listbox for panel in (getattr(self, "color_groups", None), getattr(self, "image_groups", None)) if panel]
         widgets += [page.listbox for page in self.call_pages.values()]
+        ocr_window = getattr(self, "_ocr_window", None)
+        if ocr_window is not None and ocr_window.winfo_exists():
+            ocr_window.configure(background=window)
+            widgets.append(ocr_window.ocr_text)
+            ocr_window.ocr_text.configure(insertbackground=colors["foreground"])
         for widget in widgets:
             if widget:
                 widget.configure(font=(UI_FONT_FAMILY, size))
@@ -2744,6 +2761,14 @@ class ShinClipboardApp:
             return
         self._begin_capture()
 
+    def start_ocr_capture(self) -> None:
+        """Pick a region of the screen and copy the text in it; no editor, no image kept."""
+        if self.capturing or self._countdown_window is not None:
+            self.start_capture()  # same as the other shortcuts: cancels a countdown, else ignored
+            return
+        self.start_capture()
+        self._capture_for_ocr = self.capturing
+
     def start_delayed_capture(self) -> None:
         try:
             delay = float(self.config["settings"].get("screenshot_delay_seconds", 3))
@@ -2830,15 +2855,19 @@ class ShinClipboardApp:
     def _capture_done(self, image: Image.Image | None) -> None:
         self._selector = None
         self.capturing = False
+        for_ocr, self._capture_for_ocr = self._capture_for_ocr, False
         hidden, self._hidden_for_capture = self._hidden_for_capture, []
-        if image is None:
-            # Aborted: put things back the way they were.
+        if image is None or for_ocr:
+            # Aborted, or only the text was wanted: put things back the way they were.
             for window in hidden:
                 try:
                     window.deiconify()
                 except tk.TclError:
                     pass
-            self.status_var.set("スクリーンショットを中止しました")
+            if image is None:
+                self.status_var.set("スクリーンショットを中止しました")
+            else:
+                self.ocr_image(image)
             return
         # Captured: only the editor should appear. Restoring the settings or the
         # popup here would raise them on top of it on every single shot, and the
@@ -2886,11 +2915,7 @@ class ShinClipboardApp:
         self.open_editor(image, "クリップボードの画像")
 
     def ocr_clipboard_image(self) -> None:
-        """Replace the image on the clipboard with the text read from it.
-
-        Recognition takes a moment on a large screenshot, so it runs on a worker
-        and the answer comes back through the event queue as "ocr_done".
-        """
+        """Replace the image on the clipboard with the text read from it."""
         if self.ocr_running:
             self._notify("OCR を実行中です")
             return
@@ -2898,24 +2923,113 @@ class ShinClipboardApp:
         if image is None:
             self._notify("クリップボードに画像がありません")
             return
+        self.ocr_image(image)
+
+    def ocr_image(self, image: Image.Image, report: Callable[[str], None] | None = None) -> None:
+        """Copy the text read from `image` to the clipboard.
+
+        Recognition takes a moment on a large screenshot, so it runs on a worker
+        and the answer comes back through the event queue as "ocr_done". `report`
+        is where the outcome is told - an editor's status line - defaulting to
+        the tray notification.
+        """
+        if self.ocr_running:
+            self._ocr_report(report, "OCR を実行中です")
+            return
         self.ocr_running = True
-        self.status_var.set("OCR を実行中…")
+        self._ocr_report(report, "OCR を実行中…", quiet=True)
 
         def work() -> None:
             try:
-                self.events.put(("ocr_done", (True, ocr.recognize(image))))
+                self.events.put(("ocr_done", (True, ocr.recognize(image), report)))
             except ocr.OcrError as error:
-                self.events.put(("ocr_done", (False, str(error))))
+                self.events.put(("ocr_done", (False, str(error), report)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _ocr_done(self, ok: bool, result: str) -> None:
+    def _ocr_done(self, ok: bool, result: str, report: Callable[[str], None] | None = None) -> None:
         self.ocr_running = False
         if not ok:
-            self._notify(result)
+            self._ocr_report(report, result)
             return
         self._set_clipboard(result)
-        self._notify(f"OCR の結果（{len(result)}文字）をクリップボードにコピーしました")
+        # The window itself is the news; a toast on top of it would only be noise.
+        self._ocr_report(report, f"OCR の結果（{len(result)}文字）をクリップボードにコピーしました", quiet=True)
+        self._show_ocr_result(result)
+
+    def _show_ocr_result(self, text: str) -> None:
+        """Show what was read, beside the pointer, where it can be corrected and copied again.
+
+        One window is reused: reading something new replaces its text.
+        """
+        window = getattr(self, "_ocr_window", None)
+        if window is None or not window.winfo_exists():
+            window = self._build_ocr_window()
+        body: tk.Text = window.ocr_text
+        body.delete("1.0", "end")
+        body.insert("1.0", text)
+        body.edit_reset()
+        window.ocr_status.set(f"{len(text)}文字をコピーしました。直して「コピー」で再コピーできます")
+        pointer_x, pointer_y = self.root.winfo_pointerxy()
+        window.geometry(f"+{max(0, pointer_x - 40)}+{max(0, pointer_y + 16)}")
+        window.deiconify()
+        window.lift()
+        window.attributes("-topmost", True)
+        window.after(80, lambda: window.winfo_exists() and window.attributes("-topmost", False))
+        body.focus_force()
+
+    def _build_ocr_window(self) -> tk.Toplevel:
+        colors = self._theme_colors()
+        # Not transient: the root is usually withdrawn, and a transient of a
+        # withdrawn window is never shown.
+        window = tk.Toplevel(self.root)
+        window.title("OCR の結果")
+        window.geometry("480x300")
+        window.minsize(320, 180)
+        window.configure(background="systemWindowBackgroundColor" if IS_MAC else colors["window"])
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        buttons = ttk.Frame(frame)
+        buttons.pack(side="bottom", fill="x", pady=(10, 0))
+        status = tk.StringVar()
+        ttk.Label(frame, textvariable=status, style="Muted.TLabel", wraplength=440).pack(side="bottom", anchor="w", pady=(8, 0))
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(fill="both", expand=True)
+        body = tk.Text(text_frame, wrap="word", undo=True, font=(UI_FONT_FAMILY, int(self.config["settings"].get("font_size", 11))))
+        style_list(body, colors)
+        body.configure(insertbackground=colors["foreground"])
+        scroll = ttk.Scrollbar(text_frame, orient="vertical", command=body.yview)
+        body.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        body.pack(side="left", fill="both", expand=True)
+
+        def copy() -> None:
+            value = body.get("1.0", "end-1c")
+            if value:
+                self._set_clipboard(value)
+                status.set(f"{len(value)}文字をクリップボードにコピーしました")
+
+        ttk.Button(buttons, text="閉じる", command=window.withdraw).pack(side="right")
+        ttk.Button(buttons, text="コピー", style="Accent.TButton", command=copy).pack(side="right", padx=6)
+        window.bind("<Escape>", lambda _event: window.withdraw())
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+        window.ocr_text = body
+        window.ocr_status = status
+        window.ocr_copy = copy
+        self._ocr_window = window
+        return window
+
+    def _ocr_report(self, report: Callable[[str], None] | None, message: str, quiet: bool = False) -> None:
+        if report is not None:
+            try:
+                report(message)
+                return
+            except tk.TclError:
+                pass  # the editor was closed while the text was being read
+        if quiet:
+            self.status_var.set(message)
+        else:
+            self._notify(message)
 
     def _notify(self, message: str) -> None:
         """Tell the user, even when the only window they can see is the tray icon."""
@@ -2999,6 +3113,11 @@ class ShinClipboardApp:
                 pystray.MenuItem("スクリーンショットを撮る", lambda *_: self.events.put(("screenshot", None))),
                 pystray.MenuItem("数秒後にスクリーンショットを撮る", lambda *_: self.events.put(("screenshot_delayed", None))),
                 pystray.MenuItem("クリップボードの画像を編集", lambda *_: self.events.put(("edit_clipboard_image", None))),
+                pystray.MenuItem(
+                    "範囲を選んで文字をコピー（OCR）",
+                    lambda *_: self.events.put(("screenshot_ocr", None)),
+                    visible=ocr.is_available(),
+                ),
                 pystray.MenuItem(
                     "クリップボードの画像を OCR",
                     lambda *_: self.events.put(("ocr_clipboard_image", None)),

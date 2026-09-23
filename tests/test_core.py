@@ -1045,6 +1045,125 @@ class ScreenshotAppTests(unittest.TestCase):
         finally:
             _destroy_root(root)
 
+    def test_ocr_button_reads_the_edited_picture(self):
+        from shinclipboard import ocr
+
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch.object(ocr, "is_available", return_value=True):
+                    editor = app.open_editor(Image.new("RGB", (80, 40), "red"))
+                labels = [child.cget("text") for child in editor.window.winfo_children()[-1].winfo_children()
+                          if isinstance(child, ttk.Button)]
+                self.assertIn("文字をコピー（OCR）", labels)
+                with unittest.mock.patch.object(app, "ocr_image") as run:
+                    editor.copy_text()
+                    run.assert_not_called()  # first it waits for the area
+                    editor.copy_text()
+                image, = run.call_args.args
+                self.assertEqual(image.size, (80, 40))
+                self.assertEqual(run.call_args.kwargs["report"], editor._set_status)
+                editor.close()
+
+                with unittest.mock.patch.object(ocr, "is_available", return_value=False):
+                    editor = app.open_editor(Image.new("RGB", (8, 8), "red"))
+                labels = [child.cget("text") for child in editor.window.winfo_children()[-1].winfo_children()
+                          if isinstance(child, ttk.Button)]
+                self.assertNotIn("文字をコピー（OCR）", labels, "no button where OCR cannot run")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_ocr_reads_only_the_dragged_area(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                editor = app.open_editor(Image.new("RGB", (200, 100), "white"))
+                with unittest.mock.patch.object(app, "ocr_image") as run:
+                    editor.copy_text()
+                    self.assertTrue(editor._ocr_picking)
+                    editor._read_area((10, 10), (11, 11))
+                    run.assert_not_called()
+                    self.assertTrue(editor._ocr_picking, "a slip of the mouse keeps the mode")
+                    editor._read_area((150.4, 80.2), (20.6, 30))  # dragged up and to the left
+                    image, = run.call_args.args
+                    self.assertEqual(image.size, (131, 51))
+                    self.assertFalse(editor._ocr_picking)
+
+                    # With a crop, the drag is still in source coordinates.
+                    editor.document.crop = (100, 50, 200, 100)
+                    editor.copy_text()
+                    editor._read_area((90, 40), (150, 80))
+                    image, = run.call_args.args
+                    self.assertEqual(image.size, (50, 30), "clamped to what is left after the crop")
+
+                    editor.copy_text()
+                    editor.copy_text()  # pressed again: the whole picture
+                    image, = run.call_args.args
+                    self.assertEqual(image.size, (100, 50))
+                    self.assertFalse(editor._ocr_picking)
+
+                    editor.copy_text()
+                    editor._on_escape()
+                    self.assertFalse(editor._ocr_picking)
+                    self.assertIn(editor, app.editors, "Esc only leaves the mode, it does not close the editor")
+                editor.close()
+        finally:
+            _destroy_root(root)
+
+    def test_ocr_result_window_shows_the_text_and_copies_the_correction(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                with unittest.mock.patch.object(app, "_set_clipboard") as copied:
+                    app._ocr_done(True, "最初の文字")
+                    window = app._ocr_window
+                    self.assertEqual(window.ocr_text.get("1.0", "end-1c"), "最初の文字")
+                    copied.assert_called_once_with("最初の文字")
+
+                    window.ocr_text.insert("end", "を直した")
+                    window.ocr_copy()
+                    copied.assert_called_with("最初の文字を直した")
+
+                    app._ocr_done(True, "次の文字")
+                    self.assertIs(app._ocr_window, window, "one window, reused")
+                    self.assertEqual(window.ocr_text.get("1.0", "end-1c"), "次の文字")
+                window.withdraw()
+        finally:
+            _destroy_root(root)
+
+    def test_ocr_capture_reads_the_region_without_opening_the_editor(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                shot = Image.new("RGB", (40, 20), "white")
+                with unittest.mock.patch.object(app, "_begin_capture"), \
+                        unittest.mock.patch.object(app, "ocr_image") as run, \
+                        unittest.mock.patch.object(app, "open_editor") as editor, \
+                        unittest.mock.patch.object(app, "_copy_capture") as copy:
+                    app.start_ocr_capture()
+                    self.assertTrue(app.capturing)
+                    app._capture_done(shot)
+                    run.assert_called_once_with(shot)
+                    editor.assert_not_called()
+                    copy.assert_not_called()
+
+                    app.start_capture()  # the ordinary shot afterwards is edited again
+                    app._capture_done(shot)
+                    editor.assert_called_once()
+                    self.assertEqual(run.call_count, 1)
+
+                    app.start_ocr_capture()
+                    app._capture_done(None)  # aborted
+                    self.assertEqual(run.call_count, 1)
+                    self.assertFalse(app._capture_for_ocr)
+        finally:
+            _destroy_root(root)
+
     def test_copy_and_undo_keys_leave_an_open_text_box_alone(self):
         root = self._root()
         try:

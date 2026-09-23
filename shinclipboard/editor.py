@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -9,6 +10,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
+from . import ocr
 from .annotations import (
     PALETTE,
     RASTER_KINDS,
@@ -163,6 +165,8 @@ class ImageEditorWindow:
         self._raster_cache: Image.Image | None = None
         self._drag_start: tuple[float, float] | None = None
         self._draft: Shape | None = None
+        # While True the next drag marks the area to read text from, not a shape.
+        self._ocr_picking = False
         self._moving: Shape | None = None
 
         self._offset = (0, 0)
@@ -312,6 +316,10 @@ class ImageEditorWindow:
         ttk.Button(bar, text="クリップボードへコピー", style="Accent.TButton", command=self.copy_to_clipboard).pack(side="left")
         ttk.Button(bar, text="名前を付けて保存", command=self.save_as).pack(side="left", padx=6)
         ttk.Button(bar, text="履歴へ保存", command=self.save_to_history).pack(side="left")
+        if ocr.is_available():
+            ocr_button = ttk.Button(bar, text="文字をコピー（OCR）", command=self.copy_text)
+            ocr_button.pack(side="left", padx=(6, 0))
+            _Tooltip(ocr_button, "押してから画像上をドラッグすると、その範囲の文字をテキストとしてクリップボードへコピーします。もう一度押すと画像全体を読みます", palette=lambda: self._colors)
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
 
     def _bind_keys(self) -> None:
@@ -545,6 +553,8 @@ class ImageEditorWindow:
         self._style_edit = None
         x, y = self._to_image(event.x, event.y)
         self._drag_start = (x, y)
+        if self._ocr_picking:
+            return
         tool = self.tool_var.get()
         if tool == "select":
             shape = hit_test(self.document, x, y, tolerance=max(6.0, 6.0 / max(self.zoom, 0.01)))
@@ -563,6 +573,13 @@ class ImageEditorWindow:
         if self._drag_start is None:
             return
         x, y = self._to_image(event.x, event.y)
+        if self._ocr_picking:
+            self.canvas.delete("draft")
+            self.canvas.create_rectangle(
+                *self._to_canvas(*self._drag_start), *self._to_canvas(x, y),
+                outline=self._colors["accent"], width=2, dash=(5, 3), tags="draft",
+            )
+            return
         if self._moving is not None:
             dx, dy = x - self._drag_start[0], y - self._drag_start[1]
             self._drag_start = (x, y)
@@ -589,6 +606,10 @@ class ImageEditorWindow:
         if start is None:
             return
         x, y = self._to_image(event.x, event.y)
+        if self._ocr_picking:
+            self.canvas.delete("draft")
+            self._read_area(start, (x, y))
+            return
         if tool in CLICK_TOOLS:
             self._place_click_shape(tool, x, y)
             return
@@ -826,6 +847,7 @@ class ImageEditorWindow:
 
     def _tool_changed(self) -> None:
         name = self.tool_var.get()
+        self._ocr_picking = False  # choosing a tool abandons picking an area to read
         self.selected_id = None
         self.canvas.configure(cursor="arrow" if name == "select" else "crosshair")
         self._set_status(next((hint for tool, _label, hint in TOOLS if tool == name), ""))
@@ -1006,6 +1028,9 @@ class ImageEditorWindow:
             self._set_status("切り抜きを解除しました")
 
     def _on_escape(self, _event=None) -> None:
+        if self._ocr_picking:
+            self._end_ocr_pick("OCR を取りやめました")
+            return
         if self._text_box is not None:
             self._cancel_text_box()
             return
@@ -1057,6 +1082,40 @@ class ImageEditorWindow:
         if self.app.config["settings"].get("screenshot_save_to_history", True):
             self.save_to_history(quiet=True)
         return "break"
+
+    def copy_text(self) -> str:
+        """Start reading text: the next drag marks the area, a second press takes the whole picture."""
+        if self._ocr_picking:
+            self._end_ocr_pick()
+            self.app.ocr_image(self.result(), report=self._set_status)
+            return "break"
+        if self._text_box is not None:
+            self._commit_text_box()
+        self._ocr_picking = True
+        self.canvas.configure(cursor="crosshair")
+        self._set_status("文字を読み取る範囲をドラッグしてください（もう一度押すと画像全体、Escで中止）")
+        return "break"
+
+    def _end_ocr_pick(self, message: str | None = None) -> None:
+        self._ocr_picking = False
+        self.canvas.delete("draft")
+        self.canvas.configure(cursor="arrow" if self.tool_var.get() == "select" else "crosshair")
+        if message:
+            self._set_status(message)
+
+    def _read_area(self, start: tuple[float, float], end: tuple[float, float]) -> None:
+        """Read the dragged rectangle (source-image coordinates) of the picture as exported."""
+        picture = self.result()
+        origin_x, origin_y = self._origin()
+        left = max(0, int(min(start[0], end[0]) - origin_x))
+        top = max(0, int(min(start[1], end[1]) - origin_y))
+        right = min(picture.width, math.ceil(max(start[0], end[0]) - origin_x))
+        bottom = min(picture.height, math.ceil(max(start[1], end[1]) - origin_y))
+        if right - left < 4 or bottom - top < 4:
+            self._set_status("範囲が小さすぎます。文字を囲むようにドラッグしてください（Escで中止）")
+            return
+        self._end_ocr_pick()
+        self.app.ocr_image(picture.crop((left, top, right, bottom)), report=self._set_status)
 
     def save_as(self) -> str:
         settings = self.app.config["settings"]

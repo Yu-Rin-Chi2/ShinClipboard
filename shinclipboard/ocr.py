@@ -8,6 +8,7 @@ languages the user has installed. Nothing here is available on other platforms;
 from __future__ import annotations
 
 import asyncio
+import functools
 import io
 import re
 import sys
@@ -24,13 +25,17 @@ class OcrError(Exception):
 # words, so "日 本 語 の Hello World" becomes "日本語の Hello World".
 _CJK = r"　-ヿ㐀-䶿一-鿿豈-﫿！-｠｡-ﾟ"
 _CJK_GAP = re.compile(rf"(?<=[{_CJK}]) +(?=[{_CJK}])")
+# The katakana long vowel mark "ー" comes back as a dash; between two katakana
+# a dash is never meant, so it is put back.
+_KATAKANA_DASH = re.compile(r"(?<=[ァ-ヺー]) *[-－‐―─一] *(?=[ァ-ヺ])")
 
 # Below this the engine tends to see nothing; small crops are upscaled first.
 _MIN_SIDE = 40
+_UPSCALE = 2
 
 
 def normalize_line(text: str) -> str:
-    return _CJK_GAP.sub("", text).strip()
+    return _CJK_GAP.sub("", _KATAKANA_DASH.sub("ー", text)).strip()
 
 
 def _engine():
@@ -39,6 +44,7 @@ def _engine():
     return OcrEngine.try_create_from_user_profile_languages()
 
 
+@functools.lru_cache(maxsize=1)
 def is_available() -> bool:
     if sys.platform != "win32":
         return False
@@ -49,14 +55,14 @@ def is_available() -> bool:
 
 
 def _prepare(image: Image.Image, max_side: int) -> Image.Image:
+    # UI text in a screenshot is about 12px tall, below what the engine reads
+    # well; doubling it turned "1 ↓ べ替え" into "並べ替え" and "A4 tate- bac に"
+    # into "A4_tate-back. ai" on a real capture. Going further made it worse.
     image = image.convert("RGB")
     width, height = image.size
-    if min(width, height) < _MIN_SIDE:
-        scale = _MIN_SIDE / max(1, min(width, height))
-        image = image.resize((max(1, round(width * scale)), max(1, round(height * scale))), Image.LANCZOS)
-        width, height = image.size
-    if max(width, height) > max_side:
-        scale = max_side / max(width, height)
+    scale = max(_UPSCALE, _MIN_SIDE / max(1, min(width, height)))
+    scale = min(scale, max_side / max(width, height))
+    if scale != 1:
         image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS)
     return image
 
