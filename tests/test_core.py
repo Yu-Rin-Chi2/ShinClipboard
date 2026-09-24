@@ -643,7 +643,7 @@ class AppearanceTests(unittest.TestCase):
         self.assertEqual(theme_colors("no such theme", dark=True), THEMES["blue"])
         self.assertEqual(THEME_NAMES[0], "system", "offered first in the settings, as the default")
 
-    def test_the_window_takes_the_os_colour_on_macos_and_the_theme_colour_elsewhere(self):
+    def test_the_window_takes_the_theme_colour_on_every_platform(self):
         import platform
         import tkinter as tk
 
@@ -656,19 +656,18 @@ class AppearanceTests(unittest.TestCase):
         root.withdraw()
         try:
             with tempfile.TemporaryDirectory() as folder:
-                # ttk frames are painted in the OS window colour there, and a
-                # white root showed through as a band around every one of them.
+                # macOS uses Sun Valley too, so its windows take the palette like Windows does.
                 if platform.system() == "Darwin":
                     app = self._app(root, folder)
-                    self.assertEqual(str(app.root.cget("background")), "systemWindowBackgroundColor")
-                    self.assertEqual(str(app.call_window.cget("background")), "systemWindowBackgroundColor")
-                    # The default theme follows the OS: dark lists in dark mode, blue otherwise.
-                    expected = THEMES["dark" if app._dark_appearance() else "blue"]["background"]
-                    self.assertEqual(str(app.history_list.cget("background")), expected)
+                    # The default theme follows the OS: dark in dark mode, blue otherwise.
+                    palette = THEMES["dark" if app._dark_appearance() else "blue"]
+                    self.assertEqual(str(app.root.cget("background")), palette["window"])
+                    self.assertEqual(str(app.call_window.cget("background")), palette["window"])
+                    self.assertEqual(str(app.history_list.cget("background")), palette["background"])
                     app.config["settings"]["theme"] = "blue"
                     app._apply_appearance()
                     self.assertEqual(str(app.history_list.cget("background")), "#ffffff", "a named theme is fixed")
-                    self.assertEqual(str(app.root.cget("background")), "systemWindowBackgroundColor")
+                    self.assertEqual(str(app.root.cget("background")), THEMES["blue"]["window"])
                 with unittest.mock.patch("shinclipboard.app.IS_MAC", False), unittest.mock.patch(
                     "shinclipboard.app.windows_dark_mode", return_value=False
                 ):
@@ -1341,11 +1340,13 @@ class ScreenshotAppTests(unittest.TestCase):
                 editor._text_box.insert("1.0", "注釈")
                 editor.font_var.set("Hiragino Mincho ProN")
                 editor._font_chosen()
-                self.assertEqual(root.tk.splitlist(editor._text_box.cget("font"))[0], "Hiragino Mincho ProN")
+                # Tk 9 also accepts the styled name ("... W3"), so compare the family it draws with.
+                drawn = lambda font: editor_module.tkfont.Font(root, font=font).actual("family")
+                self.assertEqual(drawn(editor._text_box.cget("font")), "Hiragino Mincho ProN")
                 editor._commit_text_box()
                 shape = editor.document.shapes[0]
                 self.assertEqual(shape.font, "Hiragino Mincho ProN")
-                self.assertEqual(editor._font(24, shape.font)[0], "Hiragino Mincho ProN", "the preview uses it too")
+                self.assertEqual(drawn(editor._font(24, shape.font)), "Hiragino Mincho ProN", "the preview uses it too")
                 self.assertEqual(app.config["settings"]["annotation_font"], "Hiragino Mincho ProN")
                 self.assertEqual(
                     app.store.load_config()["settings"]["annotation_font"], "Hiragino Mincho ProN", "and it is saved"

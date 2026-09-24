@@ -137,13 +137,11 @@ if IS_WINDOWS:
         "winrt.windows.globalization",
     ]
 
-datas = [("assets", "assets")]
-if IS_WINDOWS:
-    from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files
 
-    # sv-ttk is Tcl source and a sprite sheet read from beside the module at run
-    # time, so nothing in the import graph brings them along.
-    datas += collect_data_files("sv_ttk")
+# sv-ttk is Tcl source and a sprite sheet read from beside the module at run
+# time, so nothing in the import graph brings them along.
+datas = [("assets", "assets")] + collect_data_files("sv_ttk")
 
 a = Analysis(
     ["main.py"],

@@ -1,9 +1,9 @@
 """Colours and the ttk theme: one palette for every window, light or dark.
 
-On Windows the ttk widgets are drawn by Sun Valley (sv-ttk), the Windows 11
-look, and the plain Tk widgets the app uses next to them - lists, the editor's
-tool buttons and canvas - are painted from the same palette so the two never
-disagree. macOS keeps Aqua, which already looks native there.
+The ttk widgets are drawn by Sun Valley (sv-ttk), the Windows 11 look, on
+macOS too so that both versions of the app look the same. The plain Tk widgets
+the app uses next to them - lists, the editor's tool buttons and canvas - are
+painted from the same palette so the two never disagree.
 """
 
 from __future__ import annotations
@@ -88,23 +88,22 @@ def windows_dark_mode() -> bool:
 def apply_ttk_theme(root: tk.Tk, colors: dict[str, str]) -> None:
     """Switch the ttk theme to match the palette and restyle what the app names."""
     style = ttk.Style(root)
-    if not IS_MAC:
-        try:
-            import sv_ttk
+    try:
+        import sv_ttk
 
-            sv_ttk.set_theme("dark" if is_dark(colors) else "light", root)
-            # The switch recolours every plain Tk widget through tk_setPalette,
-            # but only once the idle loop gets to <<ThemeChanged>>. Run it now,
-            # or it lands after the lists have been painted and undoes them.
-            root.update_idletasks()
-            # Sun Valley draws in Segoe UI Variable, which has no Japanese; the
-            # fallback Windows picks for the kana is a size off and looks pasted
-            # in. The app's own face covers both.
-            for name in ("SunValleyBodyFont", "SunValleyCaptionFont", "SunValleyBodyStrongFont"):
-                tkfont.nametofont(name, root).configure(family=UI_FONT_FAMILY)
-        except (ImportError, tk.TclError):
-            if "vista" in style.theme_names():
-                style.theme_use("vista")
+        sv_ttk.set_theme("dark" if is_dark(colors) else "light", root)
+        # The switch recolours every plain Tk widget through tk_setPalette,
+        # but only once the idle loop gets to <<ThemeChanged>>. Run it now,
+        # or it lands after the lists have been painted and undoes them.
+        root.update_idletasks()
+        # Sun Valley draws in Segoe UI Variable, which has no Japanese (and
+        # macOS has no Segoe at all); the fallback picked for the kana is a
+        # size off and looks pasted in. The app's own face covers both.
+        for name in ("SunValleyBodyFont", "SunValleyCaptionFont", "SunValleyBodyStrongFont"):
+            tkfont.nametofont(name, root).configure(family=UI_FONT_FAMILY)
+    except (ImportError, tk.TclError):
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
     style.configure("Title.TLabel", font=(UI_FONT_FAMILY, 16, "bold"))
     style.configure("Subtitle.TLabel", font=(UI_FONT_FAMILY, 11, "bold"))
     style.configure("Muted.TLabel", foreground=colors["muted"])
@@ -112,8 +111,35 @@ def apply_ttk_theme(root: tk.Tk, colors: dict[str, str]) -> None:
     style.configure("Status.TLabel", foreground=colors["muted"])
 
 
-def set_title_bar_dark(window: tk.Misc, dark: bool) -> None:
-    """Ask Windows 10/11 to draw a toplevel's title bar dark or light."""
+def mac_dark_mode() -> bool:
+    """Whether macOS is in dark mode, whatever appearance the app's own windows were given."""
+    if not IS_MAC:
+        return False
+    try:
+        import AppKit
+
+        appearance = AppKit.NSApplication.sharedApplication().effectiveAppearance()
+        names = [AppKit.NSAppearanceNameAqua, AppKit.NSAppearanceNameDarkAqua]
+        return appearance.bestMatchFromAppearancesWithNames_(names) == AppKit.NSAppearanceNameDarkAqua
+    except (ImportError, AttributeError):
+        return False
+
+
+def set_title_bar_dark(window: tk.Misc, dark: bool, follow_os: bool = False) -> None:
+    """Draw a toplevel's title bar dark or light, to match the palette.
+
+    On macOS a window that follows the OS is left on "auto": a pinned
+    appearance would also stop Tk announcing the OS switching with
+    <<DarkAqua>> / <<LightAqua>>.
+    """
+    if IS_MAC:
+        try:
+            window.update_idletasks()  # Tk cannot set the appearance of a window it has not made yet
+            appearance = "auto" if follow_os else ("darkaqua" if dark else "aqua")
+            window.tk.call("::tk::unsupported::MacWindowStyle", "appearance", window, appearance)
+        except tk.TclError:
+            pass
+        return
     if not IS_WINDOWS:
         return
     try:
@@ -147,10 +173,7 @@ def style_list(widget: tk.Listbox | tk.Text, colors: dict[str, str]) -> None:
         "highlightbackground": colors["border"],
         "highlightcolor": colors["accent"],
     }
-    if IS_MAC:
-        # Aqua draws its own list frame; only the colours are the app's.
-        options = {key: options[key] for key in ("background", "foreground", "selectbackground")}
-    elif isinstance(widget, tk.Listbox):
+    if isinstance(widget, tk.Listbox):
         options["activestyle"] = "none"
         options["selectborderwidth"] = 0
     widget.configure(**options)

@@ -145,7 +145,8 @@ class ImageEditorWindow:
 
         self.window = tk.Toplevel(app.root)
         self.window.title(f"ShinClipboard - {title}")
-        self.window.geometry("1080x760")
+        # macOS sets the same toolbar wider, and at 1080 its last option is cut off.
+        self.window.geometry("1160x760" if IS_MAC else "1080x760")
         self.window.minsize(640, 480)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -210,27 +211,37 @@ class ImageEditorWindow:
         tools = ttk.Frame(bar)
         tools.pack(side="left")
         self._icons: dict[str, ImageTk.PhotoImage] = {}  # Tk drops images nobody references
-        self._tool_buttons: list[tk.Radiobutton] = []
+        self._tool_buttons: list[tk.Radiobutton | tk.Label] = []
         for name, label, hint in TOOLS:
             # Flat tiles that light up under the pointer and stay tinted while
             # chosen, the way a Windows 11 toolbar marks its current tool.
-            button = tk.Radiobutton(
-                tools,
-                value=name,
-                variable=self.tool_var,
-                command=self._tool_changed,
-                indicatoron=False,
-                relief="flat",
-                overrelief="flat",
-                borderwidth=0,
-                highlightthickness=0,
-                padx=7,
-                pady=5,
-                cursor="hand2",
-            )
+            if IS_MAC:
+                # Aqua draws a Radiobutton as a native bezel and ignores its
+                # colours; a Label is painted exactly as asked.
+                button = tk.Label(tools, borderwidth=0, highlightthickness=0, padx=7, pady=5, cursor="hand2")
+                button.bind("<Button-1>", lambda _event, value=name: self._choose_tool(value))
+                button.bind("<Enter>", lambda _event, tile=button: self._hover_tool(tile, True))
+                button.bind("<Leave>", lambda _event, tile=button: self._hover_tool(tile, False))
+            else:
+                button = tk.Radiobutton(
+                    tools,
+                    value=name,
+                    variable=self.tool_var,
+                    command=self._tool_changed,
+                    indicatoron=False,
+                    relief="flat",
+                    overrelief="flat",
+                    borderwidth=0,
+                    highlightthickness=0,
+                    padx=7,
+                    pady=5,
+                    cursor="hand2",
+                )
             button.pack(side="left", padx=1)
             self._tool_buttons.append(button)
             _Tooltip(button, f"{label}　{hint}", palette=lambda: self._colors)
+        if IS_MAC:
+            self.tool_var.trace_add("write", lambda *_: self._paint_tool_tiles())
         self._paint_tools()
 
         options = ttk.Frame(self.window, padding=(12, 0, 12, 8))
@@ -973,12 +984,33 @@ class ImageEditorWindow:
             # accent rather than a pale ink it would vanish into.
             ink = colors["accent"] if name == "number" and mode == "dark" else TOOL_INK[mode]
             self._icons[name] = ImageTk.PhotoImage(tool_icon(name, ink=ink), master=self.window)
-            button.configure(
-                image=self._icons[name],
-                background=colors["window"],
-                activebackground=colors["tool_hover"],
-                selectcolor=colors["tool_selected"],
-            )
+            if isinstance(button, tk.Radiobutton):
+                button.configure(
+                    image=self._icons[name],
+                    background=colors["window"],
+                    activebackground=colors["tool_hover"],
+                    selectcolor=colors["tool_selected"],
+                )
+            else:
+                button.configure(image=self._icons[name])
+        self._paint_tool_tiles()
+
+    def _paint_tool_tiles(self) -> None:
+        """Tint the chosen tool's Label tile, which unlike a Radiobutton does not do it itself."""
+        chosen = self.tool_var.get()
+        for button, (name, _label, _hint) in zip(self._tool_buttons, TOOLS):
+            if isinstance(button, tk.Label):
+                button.configure(background=self._colors["tool_selected" if name == chosen else "window"])
+
+    def _choose_tool(self, name: str) -> None:
+        self.tool_var.set(name)
+        self._tool_changed()
+
+    def _hover_tool(self, tile: tk.Label, inside: bool) -> None:
+        if inside and self.tool_var.get() != TOOLS[self._tool_buttons.index(tile)][0]:
+            tile.configure(background=self._colors["tool_hover"])
+        else:
+            self._paint_tool_tiles()
 
     def apply_theme(self, colors: dict[str, str]) -> None:
         """Repaint the plain Tk parts after the app switched between light and dark."""

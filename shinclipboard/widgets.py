@@ -328,9 +328,6 @@ class ImageListbox(tk.Text):
         # list holds the focus whenever the popup is open: in dark mode that is
         # a white frame around it. A list gets the Listbox's thin border instead.
         kwargs.setdefault("highlightthickness", 0)
-        if IS_MAC:
-            kwargs.setdefault("relief", "solid")
-            kwargs.setdefault("borderwidth", 1)
         super().__init__(master, **kwargs)
         self._rows: list[dict[str, object]] = []
         self._selected: int | None = None

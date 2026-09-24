@@ -63,6 +63,7 @@ from .theme import (
     THEMES,
     apply_ttk_theme,
     is_dark,
+    mac_dark_mode,
     set_title_bar_dark,
     style_list,
     theme_colors,
@@ -232,14 +233,11 @@ class ShinClipboardApp:
         # The ttk theme goes on before any widget is built: some of them read
         # their colours from it once, at construction.
         apply_ttk_theme(self.root, self._theme_colors())
-        style = ttk.Style()
         # Every toplevel - dialogs included - gets its title bar drawn to match
         # as it first appears, so none of them needs to ask for it itself.
         self.root.bind_class("Toplevel", "<Map>", self._match_title_bar, add="+")
         self.root.bind("<Map>", self._match_title_bar, add="+")
         if IS_MAC:
-            # Aqua sets the tab titles almost edge to edge in their segments.
-            style.configure("TNotebook.Tab", padding=(22, 5))
             # Tk announces a switch of the system appearance with these; the
             # "system" theme repaints the lists to match.
             self.root.bind("<<DarkAqua>>", self._appearance_changed, add="+")
@@ -942,12 +940,8 @@ class ShinClipboardApp:
 
     def _dark_appearance(self) -> bool:
         """Whether the OS is showing apps in dark mode; False wherever it cannot say."""
-        if not IS_MAC:
-            return windows_dark_mode()
-        try:
-            return bool(int(self.root.tk.call("::tk::unsupported::MacWindowStyle", "isdark", self.root)))
-        except (tk.TclError, ValueError):
-            return False
+        # Not the window's own appearance: a fixed theme pins that to its palette.
+        return mac_dark_mode() if IS_MAC else windows_dark_mode()
 
     def _appearance_changed(self, _event=None) -> None:
         """The OS switched between light and dark: repaint everything the theme colours."""
@@ -977,7 +971,11 @@ class ShinClipboardApp:
     def _match_title_bar(self, event) -> None:
         """Draw a toplevel's title bar in the theme's light or dark."""
         if event.widget is self.root or isinstance(event.widget, tk.Toplevel):
-            set_title_bar_dark(event.widget, is_dark(self._theme_colors()))
+            self._paint_title_bar(event.widget)
+
+    def _paint_title_bar(self, window: tk.Misc) -> None:
+        follow_os = self.config["settings"].get("theme", "blue") == SYSTEM_THEME
+        set_title_bar_dark(window, is_dark(self._theme_colors()), follow_os=follow_os)
 
     def _refresh_all(self) -> None:
         self._refresh_history()
@@ -2506,11 +2504,10 @@ class ShinClipboardApp:
         settings = self.config["settings"]
         size = int(settings.get("font_size", 11))
         colors = self._theme_colors()
-        # ttk paints its frames in the OS's window colour. On Windows that is
-        # close to the theme's white; on macOS it is a light or dark grey, and
-        # a white window shows through as a band around every ttk frame.
+        # The toplevels take the colour Sun Valley paints its frames in, or it
+        # shows through as a band around every ttk frame.
         apply_ttk_theme(self.root, colors)
-        window = "systemWindowBackgroundColor" if IS_MAC else colors["window"]
+        window = colors["window"]
         self.root.configure(background=window)
         toplevels = [self.root]
         if hasattr(self, "call_window"):
@@ -2518,7 +2515,7 @@ class ShinClipboardApp:
             toplevels.append(self.call_window)
         for toplevel in toplevels:
             if toplevel.winfo_ismapped():
-                set_title_bar_dark(toplevel, is_dark(colors))
+                self._paint_title_bar(toplevel)
         self.root.attributes("-topmost", bool(settings.get("always_on_top", False)))
         widgets = [getattr(self, name, None) for name in ("history_list", "group_list", "fifo_list", "call_history_list")]
         widgets += [panel.listbox for panel in (getattr(self, "color_groups", None), getattr(self, "image_groups", None)) if panel]
@@ -2986,7 +2983,7 @@ class ShinClipboardApp:
         window.title("OCR の結果")
         window.geometry("480x300")
         window.minsize(320, 180)
-        window.configure(background="systemWindowBackgroundColor" if IS_MAC else colors["window"])
+        window.configure(background=colors["window"])
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill="both", expand=True)
         buttons = ttk.Frame(frame)

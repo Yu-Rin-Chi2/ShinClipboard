@@ -4,8 +4,8 @@ pystray>=0.19.5,<1
 Pillow>=10,<12
 tkinterdnd2>=0.4,<1
 pywin32>=306; sys_platform == "win32"
-# The Windows 11 look for the ttk widgets; macOS keeps its native Aqua theme.
-sv-ttk>=2.6,<3; sys_platform == "win32"
+# The Windows 11 look for the ttk widgets, on macOS too so both look the same.
+sv-ttk>=2.6,<3
 # OCR of a clipboard image with the engine built into Windows (Windows.Media.Ocr).
 winrt-runtime>=3,<4; sys_platform == "win32"
 winrt-Windows.Media.Ocr>=3,<4; sys_platform == "win32"
