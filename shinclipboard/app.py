@@ -23,7 +23,7 @@ from . import ocr
 from .clipboard_images import clipboard_change_token, read_clipboard_image, write_clipboard_image
 from .colors import normalize_hex_color, parse_hex_color, swatch_image
 from .core import FifoQueue, HistoryItem
-from .editor import ImageEditorWindow, cleanup_exports, write_export
+from .editor import PRIMARY_KEY, ImageEditorWindow, cleanup_exports, write_export
 from .fonts import CATALOG as FONT_CATALOG
 from .hotkeys import GlobalHotkeyService
 from .macos import (
@@ -69,7 +69,7 @@ from .theme import (
     theme_colors,
     windows_dark_mode,
 )
-from .transforms import apply_enabled, apply_transform
+from .transforms import TRANSFORM_TYPES, apply_enabled, apply_transform, transform_kind, transform_label
 from .widgets import GROUP_LIST_WIDTH, FlowBar, GroupPanel, ImageListbox, ScrollableFrame, fit_tree_columns
 
 
@@ -81,7 +81,7 @@ def resource_path(relative: str) -> Path:
 QUICK_KEYS = "1234567890abcdefghijklmnopqrstuvwxyz"
 CALL_WINDOW_HINT = (
     "Tab: 履歴/定型文/色/画像   ←→: グループ   1〜0/a〜z/Enter: 貼り付け   "
-    "Ctrl+E: 画像を編集   ドラッグ: 他アプリへ   Esc: 閉じる"
+    "Ctrl+E: 画像を編集   Ctrl+,: 設定・編集   ドラッグ: 他アプリへ   Esc: 閉じる"
 )
 THUMBNAIL_SIZE = (200, 72)  # max width / height of image previews in the popup
 TREE_THUMBNAIL_SIZE = (96, 52)  # previews in the image tab's table
@@ -143,6 +143,7 @@ class ShinClipboardApp:
         self.fifo = FifoQueue()
         self.stock_mode = "off"
         self.fifo_enabled = False
+        self._stock_empty_notified = False
         self.monitor_enabled = True
         self.last_fifo_value: str | None = None
         self.last_clipboard = self._read_clipboard()
@@ -172,6 +173,7 @@ class ShinClipboardApp:
         self.fifo_status_var = tk.StringVar()
         self.group_var = tk.StringVar()
         self.popup_hotkey_var = tk.StringVar()
+        self.settings_hotkey_var = tk.StringVar()
         self.fifo_hotkey_var = tk.StringVar()
         self.lifo_hotkey_var = tk.StringVar()
         self.monitor_hotkey_var = tk.StringVar()
@@ -287,6 +289,7 @@ class ShinClipboardApp:
         self.tabs.add(self.fifo_tab, text="FIFO")
         self.tabs.add(self.transform_tab, text="整形")
         self.tabs.add(settings_scroller, text="設定")
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _: self._refresh_transform_target())
         self._build_history_tab()
         self._build_snippet_tab()
         self._build_color_tab()
@@ -324,12 +327,18 @@ class ShinClipboardApp:
         for sequence in ("<Right>", "<Control-Right>"):
             self.call_window.bind(sequence, lambda _: self._move_call_group(1))
 
-        hint = ttk.Label(self.call_window, text=CALL_WINDOW_HINT, style="Hint.TLabel", padding=(10, 4, 10, 6))
-        hint.pack(side="bottom", fill="x")
+        footer = ttk.Frame(self.call_window)
+        footer.pack(side="bottom", fill="x")
+        # The settings window used to be reachable only from the tray icon.
+        ttk.Button(footer, text="⚙ 設定・編集", command=self._open_settings_from_popup).pack(side="right", padx=(0, 8), pady=(2, 6))
+        hint = ttk.Label(footer, text=CALL_WINDOW_HINT, style="Hint.TLabel", padding=(10, 4, 10, 6))
+        hint.pack(side="left", fill="x", expand=True)
         # The hint lists every key and the window is small and resizable, so it
         # does not fit on one line at every size or in every desktop's UI font.
         # Wrapping to the width it actually has beats clipping the last keys off.
         hint.bind("<Configure>", lambda event, label=hint: self._wrap_label(label, event.width))
+        self.call_stock_label = ttk.Label(self.call_window, style="Accent.TLabel", padding=(10, 4, 10, 0))
+        self._call_footer = footer
         self.call_tabs = ttk.Notebook(self.call_window)
         self.call_tabs.pack(fill="both", expand=True, padx=8, pady=(8, 2))
         history_frame = ttk.Frame(self.call_tabs, padding=6)
@@ -344,6 +353,9 @@ class ShinClipboardApp:
         # Ctrl is in `shortcut_modifier_mask`, so `_quick_select` ignores this and
         # a bare "e" still pastes as before.
         self.call_window.bind("<Control-e>", self._edit_call_history_image)
+        self.call_window.bind("<Control-comma>", self._open_settings_from_popup)
+        if IS_MAC:
+            self.call_window.bind("<Command-comma>", self._open_settings_from_popup)  # the macOS convention
 
         snippet_page = self._build_call_page("定型文", "groups", "snippets", self._render_snippet_row, plain=True)
         self._build_call_page("色", "color_groups", "colors", self._render_color_row)
@@ -408,6 +420,7 @@ class ShinClipboardApp:
         self.history_list.pack(fill="both", expand=True)
         self.history_list.bind("<Button-3>", self._history_right_click)
         self.history_list.bind("<Return>", lambda _: self._paste_selected_history())
+        self.history_list.bind("<<ListboxSelect>>", lambda _: self._refresh_transform_target())
         bar = FlowBar(self.history_tab)
         bar.pack(fill="x", pady=(8, 0))
         bar.add(ttk.Button(bar, text="クリップボードへ", command=self._copy_selected_history))
@@ -564,7 +577,8 @@ class ShinClipboardApp:
         ttk.Label(top, textvariable=self.fifo_status_var, font=(UI_FONT_FAMILY, 12, "bold")).pack(side="left")
         self.fifo_toggle_button = ttk.Button(top, text="FIFO開始", command=self.toggle_fifo)
         self.fifo_toggle_button.pack(side="right")
-        ttk.Button(top, text="LIFO開始", command=self.toggle_lifo).pack(side="right", padx=6)
+        self.lifo_toggle_button = ttk.Button(top, text="LIFO開始", command=self.toggle_lifo)
+        self.lifo_toggle_button.pack(side="right", padx=6)
         ttk.Button(top, text="停止", command=self.stop_stock).pack(side="right")
         self.fifo_list = tk.Listbox(self.fifo_tab, font=(UI_FONT_FAMILY, 11))
         self.fifo_list.pack(fill="both", expand=True)
@@ -585,7 +599,8 @@ class ShinClipboardApp:
         form = ttk.Frame(self.settings_tab)
         form.pack(fill="x")
         rows = [
-            ("画面表示ショートカット（空欄で無効）", self.popup_hotkey_var),
+            ("呼び出し画面ショートカット（空欄で無効）", self.popup_hotkey_var),
+            ("設定・編集画面ショートカット（空欄で無効）", self.settings_hotkey_var),
             ("FIFO切替ショートカット", self.fifo_hotkey_var),
             ("LIFO切替ショートカット", self.lifo_hotkey_var),
             ("監視切替ショートカット", self.monitor_hotkey_var),
@@ -630,7 +645,7 @@ class ShinClipboardApp:
             ("常に手前へ表示", self.always_on_top_var),
             ("最小化状態で起動", self.start_minimized_var),
             ("OSログイン時に起動", self.startup_var),
-            ("Ctrlキー2回で画面表示", self.double_ctrl_var),
+            ("Ctrlキー2回で呼び出し画面を表示", self.double_ctrl_var),
         ]
         for index, (label, variable) in enumerate(checks):
             ttk.Checkbutton(advanced, text=label, variable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 25), pady=3)
@@ -650,10 +665,16 @@ class ShinClipboardApp:
         ttk.Entry(delay_row, textvariable=self.screenshot_delay_hotkey_var, width=24).pack(side="left")
         ttk.Label(delay_row, text="秒数").pack(side="left", padx=(12, 4))
         ttk.Spinbox(delay_row, from_=1, to=60, textvariable=self.screenshot_delay_var, width=5).pack(side="left")
-        # Only where OCR can run; elsewhere the row would promise a shortcut that does nothing.
-        if ocr.is_available():
-            ttk.Label(shots, text="範囲を選んで文字をコピー（OCR）").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
+        # Only where OCR can run; elsewhere the row says why instead of offering a
+        # shortcut that would do nothing.
+        ttk.Label(shots, text="範囲を選んで文字をコピー（OCR）").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=4)
+        ocr_problem = ocr.unavailable_reason()
+        if ocr_problem is None:
             ttk.Entry(shots, textvariable=self.screenshot_ocr_hotkey_var, width=24).grid(row=2, column=1, sticky="w", pady=4)
+        else:
+            reason = ttk.Label(shots, text=f"使えません: {ocr_problem}", style="Muted.TLabel")
+            reason.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+            reason.bind("<Configure>", lambda event, label=reason: self._wrap_label(label, event.width))
         ttk.Label(shots, text="既定の保存先（空欄でピクチャ）").grid(row=3, column=0, sticky="w", padx=(0, 14), pady=4)
         ttk.Entry(shots, textvariable=self.screenshot_dir_var, width=40).grid(row=3, column=1, sticky="w", pady=4)
         ttk.Button(shots, text="選ぶ", command=self._choose_screenshot_dir).grid(row=3, column=2, sticky="w", padx=6)
@@ -797,9 +818,11 @@ class ShinClipboardApp:
     def _build_transform_tab(self) -> None:
         ttk.Label(
             self.transform_tab,
-            text="履歴へ保存する前に、手動または自動でテキストを整形できます。",
+            text="「履歴」タブで選んだ項目に、ここで選んだルールを適用します。履歴の右クリック「整形を適用」からも使えます。",
             style="Muted.TLabel",
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(anchor="w", fill="x", pady=(0, 4))
+        self.transform_target_var = tk.StringVar()
+        ttk.Label(self.transform_tab, textvariable=self.transform_target_var, style="Accent.TLabel").pack(anchor="w", fill="x", pady=(0, 8))
         self.transform_tree = ttk.Treeview(
             self.transform_tab,
             columns=("name", "type", "hotkey", "auto"),
@@ -883,6 +906,8 @@ class ShinClipboardApp:
                     self.toggle_monitor()
                 elif event == "undo_fifo":
                     self.undo_fifo()
+                elif event == "stock_empty":
+                    self._notify("ストックが空です。コピーすると追加されます")
                 elif event == "paste_text":
                     self._paste_text(str(payload))
                 elif event == "paste_image":
@@ -989,6 +1014,9 @@ class ShinClipboardApp:
     def _refresh_history(self) -> None:
         if not hasattr(self, "history_list"):
             return
+        # A new copy rebuilds the list; keep what was picked so the 整形 tab
+        # still has its target after switching tabs.
+        kept = {id(self.visible_history[index]) for index in self.history_list.curselection() if index < len(self.visible_history)}
         self.visible_history = self.history.search(self.search_var.get())
         self.history_list.delete(0, "end")
         colors = self._theme_colors()
@@ -1007,6 +1035,9 @@ class ShinClipboardApp:
                 selectbackground=colors["accent"],
                 selectforeground="#ffffff",
             )
+            if id(item) in kept:
+                self.history_list.selection_set(index)
+        self._refresh_transform_target()
         self._refresh_call_history()
 
     def _refresh_call_window(self) -> None:
@@ -1183,6 +1214,12 @@ class ShinClipboardApp:
             menu.add_command(label="編集", command=self._edit_history)
             if parse_hex_color(item.text) is not None:
                 menu.add_command(label="色に登録...", command=lambda: self._register_history_color(item))
+            rules = self.config.get("transforms", [])
+            if rules:
+                transform_menu = tk.Menu(menu, tearoff=0)
+                for rule in rules:
+                    transform_menu.add_command(label=rule["name"], command=lambda value=rule: self._apply_transform_to(item.text, value))
+                menu.add_cascade(label="整形を適用", menu=transform_menu)
         menu.add_separator()
         menu.add_command(label="削除", command=self._delete_history)
         try:
@@ -2090,6 +2127,11 @@ class ShinClipboardApp:
         self.tabs.select(self.image_tab)
         self._add_image(picture)
 
+    def _open_settings_from_popup(self, _event=None) -> str:
+        self.hide_call_window()
+        self.show_settings_window()
+        return "break"
+
     def _register_from_popup(self, item: HistoryItem) -> None:
         """The popup's "register" entries: the dialog needs a visible owner, so the settings window opens."""
         self.hide_call_window()
@@ -2159,31 +2201,40 @@ class ShinClipboardApp:
             open_settings_pane(ACCESSIBILITY_PANE)
 
     def toggle_fifo(self) -> None:
-        self.stock_mode = "off" if self.stock_mode == "fifo" else "fifo"
-        self.fifo_enabled = self.stock_mode != "off"
-        self.last_fifo_value = None
-        self._refresh_fifo()
-        self.status_var.set("FIFOモードを有効にしました" if self.stock_mode == "fifo" else "ストックモードを停止しました")
+        self._set_stock_mode("off" if self.stock_mode == "fifo" else "fifo")
 
     def toggle_lifo(self) -> None:
-        self.stock_mode = "off" if self.stock_mode == "lifo" else "lifo"
-        self.fifo_enabled = self.stock_mode != "off"
-        self.last_fifo_value = None
-        self._refresh_fifo()
-        self.status_var.set("LIFOモードを有効にしました" if self.stock_mode == "lifo" else "ストックモードを停止しました")
+        self._set_stock_mode("off" if self.stock_mode == "lifo" else "lifo")
 
     def stop_stock(self) -> None:
-        self.stock_mode = "off"
-        self.fifo_enabled = False
+        self._set_stock_mode("off")
+
+    def _set_stock_mode(self, mode: str) -> None:
+        # The same shortcut starts and stops a mode and nothing else on screen
+        # shows it, so every switch is announced through the tray as well.
+        self.stock_mode = mode
+        self.fifo_enabled = mode != "off"
         self.last_fifo_value = None
+        self._stock_empty_notified = False
         self._refresh_fifo()
+        if mode == "off":
+            self._notify("ストックモードを停止しました")
+        else:
+            order = "コピーした順" if mode == "fifo" else "新しい順"
+            self._notify(f"{mode.upper()}モード開始（{len(self.fifo)}件）: {PRIMARY_KEY}+V を押すたびに{order}で1件ずつ貼り付けます")
 
     def _fifo_paste_hotkey(self) -> None:
         if not self.fifo_enabled:
             return
         text = self.fifo.pop(self.stock_mode)
         if text is None:
+            # The clipboard still holds the last item, so the paste repeats it;
+            # say why once instead of letting it look like the mode is broken.
+            if not self._stock_empty_notified:
+                self._stock_empty_notified = True
+                self.events.put(("stock_empty", None))
             return
+        self._stock_empty_notified = False
         self.last_fifo_value = text
         self.ignore_fifo_text = text
         pyperclip.copy(text)
@@ -2235,31 +2286,35 @@ class ShinClipboardApp:
         mode_label = {"off": "停止中", "fifo": "FIFO", "lifo": "LIFO"}[self.stock_mode]
         self.fifo_status_var.set(f"ストックモード: {mode_label}（{len(self.fifo)}件）")
         self.fifo_toggle_button.configure(text="FIFO停止" if self.stock_mode == "fifo" else "FIFO開始")
+        self.lifo_toggle_button.configure(text="LIFO停止" if self.stock_mode == "lifo" else "LIFO開始")
+        self._refresh_call_stock_label()
         self.fifo_list.delete(0, "end")
         for index, value in enumerate(self.fifo.values(), 1):
             self.fifo_list.insert("end", f"{index}. {value.replace(chr(10), ' ↵ ')[:180]}")
+
+    def _refresh_call_stock_label(self) -> None:
+        """Show the running FIFO/LIFO mode in the popup too, where people paste from."""
+        label = getattr(self, "call_stock_label", None)
+        if label is None:
+            return
+        if self.stock_mode == "off":
+            label.pack_forget()
+            return
+        label.configure(text=f"● {self.stock_mode.upper()}モード中（残り{len(self.fifo)}件）  {PRIMARY_KEY}+V で順に貼り付け")
+        if not label.winfo_ismapped():
+            label.pack(side="bottom", fill="x", after=self._call_footer)
 
     def _refresh_transforms(self) -> None:
         if not hasattr(self, "transform_tree"):
             return
         for item in self.transform_tree.get_children():
             self.transform_tree.delete(item)
-        labels = {
-            "prefix_each_line": "各行に挿入",
-            "surround_each_line": "各行の前後に挿入",
-            "number_lines": "連番",
-            "regex": "正規表現置換",
-            "trim": "前後空白削除",
-            "upper": "大文字化",
-            "lower": "小文字化",
-            "prefix_suffix": "全文の前後に挿入",
-        }
         for rule in self.config.get("transforms", []):
             self.transform_tree.insert(
                 "",
                 "end",
                 iid=rule["id"],
-                values=(rule["name"], labels.get(rule.get("type"), rule.get("type")), rule.get("hotkey", ""), "有効" if rule.get("auto") else ""),
+                values=(rule["name"], transform_label(rule.get("type", "")), rule.get("hotkey", ""), "有効" if rule.get("auto") else ""),
             )
 
     def _selected_transform(self) -> dict | None:
@@ -2288,20 +2343,35 @@ class ShinClipboardApp:
         elif type_var.get() == "prefix_suffix": first_var.set(str(params.get("prefix", ""))); second_var.set(str(params.get("suffix", "")))
         form = ttk.Frame(dialog, padding=14)
         form.pack(fill="both", expand=True)
+        type_var.set(transform_label(type_var.get()))
+        value_labels: list[ttk.Label] = []
+        value_entries: list[ttk.Entry] = []
         for row, (label, variable) in enumerate((("整形名", name_var), ("方法", type_var), ("値1", first_var), ("値2", second_var), ("ショートカット", hotkey_var))):
-            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
+            label_widget = ttk.Label(form, text=label)
+            label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 12))
             if row == 1:
-                widget = ttk.Combobox(form, textvariable=variable, state="readonly", values=("prefix_each_line", "surround_each_line", "number_lines", "regex", "trim", "upper", "lower", "prefix_suffix"))
+                widget = ttk.Combobox(form, textvariable=variable, state="readonly", values=[name for name, _, _ in TRANSFORM_TYPES.values()])
             else:
                 widget = ttk.Entry(form, textvariable=variable)
+                if row in (2, 3):
+                    value_labels.append(label_widget)
+                    value_entries.append(widget)
             widget.grid(row=row, column=1, sticky="ew", pady=6)
         form.columnconfigure(1, weight=1)
         ttk.Checkbutton(form, text="コピー時に自動適用", variable=auto_var).grid(row=5, column=1, sticky="w", pady=6)
-        ttk.Label(form, text="値1/値2: 前/後、正規表現/置換、連番の桁数/区切りとして使います。", style="Muted.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=5)
+
+        def update_value_fields(*_args) -> None:
+            _, first_label, second_label = TRANSFORM_TYPES.get(transform_kind(type_var.get()), ("", None, None))
+            for label_widget, entry, text in zip(value_labels, value_entries, (first_label, second_label)):
+                label_widget.configure(text=text or "（使いません）")
+                entry.state(["!disabled"] if text else ["disabled"])
+
+        type_var.trace_add("write", update_value_fields)
+        update_value_fields()
         result: list[dict] = []
 
         def accept() -> None:
-            kind = type_var.get()
+            kind = transform_kind(type_var.get())
             if not name_var.get().strip():
                 return
             if kind == "prefix_each_line": values = {"prefix": first_var.get()}
@@ -2353,12 +2423,34 @@ class ShinClipboardApp:
             self._save_config(restart_hotkeys=True)
             self._refresh_transforms()
 
+    def _transform_target(self) -> tuple[str, str]:
+        """The text a manual 整形 works on, and where it comes from."""
+        item = self._selected_history()
+        if item is not None:
+            return (item.text, "履歴で選択中")
+        return (self._read_clipboard(), "履歴が未選択のため、現在のクリップボード")
+
+    def _refresh_transform_target(self) -> None:
+        # Only while the tab is open: without a selection this reads the clipboard.
+        if not hasattr(self, "transform_target_var") or self.tabs.select() != str(self.transform_tab):
+            return
+        text, source = self._transform_target()
+        if not text:
+            self.transform_target_var.set("対象: なし（「履歴」タブでテキストの項目を選んでください）")
+            return
+        preview = text.replace("\r", " ").replace("\n", " ↵ ")
+        self.transform_target_var.set(f"対象（{source}）: {preview[:60]}{'…' if len(preview) > 60 else ''}")
+
     def _apply_selected_transform(self) -> None:
         rule = self._selected_transform()
-        item = self._selected_history()
-        text = item.text if item else self._read_clipboard()
-        if not rule or not text:
-            self.status_var.set("整形と対象履歴を選択してください")
+        if not rule:
+            self.status_var.set("適用する整形ルールを選択してください")
+            return
+        self._apply_transform_to(self._transform_target()[0], rule)
+
+    def _apply_transform_to(self, text: str, rule: dict) -> None:
+        if not text:
+            self.status_var.set("整形の対象がありません。「履歴」タブでテキストの項目を選んでください")
             return
         try:
             value = apply_transform(text, rule)
@@ -2383,6 +2475,7 @@ class ShinClipboardApp:
     def _load_settings_fields(self) -> None:
         settings = self.config["settings"]
         self.popup_hotkey_var.set(settings["popup_hotkey"])
+        self.settings_hotkey_var.set(settings.get("settings_hotkey", ""))
         self.fifo_hotkey_var.set(settings["fifo_toggle_hotkey"])
         self.lifo_hotkey_var.set(settings["lifo_toggle_hotkey"])
         self.monitor_hotkey_var.set(settings["monitor_toggle_hotkey"])
@@ -2420,6 +2513,7 @@ class ShinClipboardApp:
             return
         settings = self.config["settings"]
         settings["popup_hotkey"] = self.popup_hotkey_var.get().strip().lower()
+        settings["settings_hotkey"] = self.settings_hotkey_var.get().strip().lower()
         settings["fifo_toggle_hotkey"] = self.fifo_hotkey_var.get().strip().lower()
         settings["lifo_toggle_hotkey"] = self.lifo_hotkey_var.get().strip().lower()
         settings["monitor_toggle_hotkey"] = self.monitor_hotkey_var.get().strip().lower()
@@ -2473,6 +2567,8 @@ class ShinClipboardApp:
         }
         if settings["popup_hotkey"].strip():
             mappings[settings["popup_hotkey"]] = lambda: self.events.put(("show", None))
+        if str(settings.get("settings_hotkey", "")).strip():
+            mappings[settings["settings_hotkey"]] = lambda: self.events.put(("show_settings", None))
         if str(settings.get("screenshot_hotkey", "")).strip():
             mappings[settings["screenshot_hotkey"]] = lambda: self.events.put(("screenshot", None))
         if str(settings.get("screenshot_delay_hotkey", "")).strip():

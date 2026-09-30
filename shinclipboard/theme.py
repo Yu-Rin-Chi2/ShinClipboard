@@ -108,6 +108,7 @@ def apply_ttk_theme(root: tk.Tk, colors: dict[str, str]) -> None:
     style.configure("Subtitle.TLabel", font=(UI_FONT_FAMILY, 11, "bold"))
     style.configure("Muted.TLabel", foreground=colors["muted"])
     style.configure("Hint.TLabel", foreground=colors["muted"], font=(UI_FONT_FAMILY, 9))
+    style.configure("Accent.TLabel", foreground=colors["accent"], font=(UI_FONT_FAMILY, 10, "bold"))
     style.configure("Status.TLabel", foreground=colors["muted"])
 
 

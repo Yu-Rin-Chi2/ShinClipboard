@@ -139,3 +139,29 @@ class RealOcrTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnavailableReasonTests(unittest.TestCase):
+    """When OCR is missing, the settings tab says why instead of hiding the row."""
+
+    def setUp(self):
+        ocr.unavailable_reason.cache_clear()
+        self.addCleanup(ocr.unavailable_reason.cache_clear)
+
+    def test_other_platforms_are_told_it_is_windows_only(self):
+        with unittest.mock.patch.object(ocr.sys, "platform", "darwin"):
+            self.assertIn("Windows 版のみ", ocr.unavailable_reason())
+            self.assertFalse(ocr.is_available())
+
+    def test_a_missing_language_is_named(self):
+        with unittest.mock.patch.object(ocr.sys, "platform", "win32"), unittest.mock.patch.object(ocr, "_engine", return_value=None):
+            self.assertIn("光学式文字認識", ocr.unavailable_reason())
+
+    def test_missing_winrt_is_named(self):
+        with unittest.mock.patch.object(ocr.sys, "platform", "win32"), unittest.mock.patch.object(ocr, "_engine", side_effect=ImportError("No module named 'winrt'")):
+            self.assertIn("winrt", ocr.unavailable_reason())
+
+    def test_a_working_engine_has_no_reason(self):
+        with unittest.mock.patch.object(ocr.sys, "platform", "win32"), unittest.mock.patch.object(ocr, "_engine", return_value=object()):
+            self.assertIsNone(ocr.unavailable_reason())
+            self.assertTrue(ocr.is_available())

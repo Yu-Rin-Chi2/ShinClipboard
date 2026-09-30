@@ -3,6 +3,26 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+# 整形方法ごとの表示名と、値1/値2 の意味（使わない値は None）
+TRANSFORM_TYPES: dict[str, tuple[str, str | None, str | None]] = {
+    "prefix_each_line": ("各行に挿入", "行頭に入れる文字", None),
+    "surround_each_line": ("各行の前後に挿入", "行頭に入れる文字", "行末に入れる文字"),
+    "number_lines": ("連番", "桁数", "区切り"),
+    "regex": ("正規表現置換", "検索パターン", "置換後"),
+    "trim": ("前後空白削除", None, None),
+    "upper": ("大文字化", None, None),
+    "lower": ("小文字化", None, None),
+    "prefix_suffix": ("全文の前後に挿入", "先頭に入れる文字", "末尾に入れる文字"),
+}
+
+
+def transform_label(kind: str) -> str:
+    return TRANSFORM_TYPES.get(kind, (kind, None, None))[0]
+
+
+def transform_kind(label: str) -> str:
+    return next((kind for kind, (name, _, _) in TRANSFORM_TYPES.items() if name == label), label)
+
 
 def apply_transform(text: str, rule: dict[str, Any]) -> str:
     kind = rule.get("type", "")

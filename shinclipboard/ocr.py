@@ -45,13 +45,27 @@ def _engine():
 
 
 @functools.lru_cache(maxsize=1)
-def is_available() -> bool:
+def unavailable_reason() -> str | None:
+    """Why OCR cannot run here, in words for the user; None when it can."""
     if sys.platform != "win32":
-        return False
+        return "OCR は Windows 版のみの機能です"
     try:
-        return _engine() is not None
-    except Exception:  # missing winrt packages or an OS without the API
-        return False
+        engine = _engine()
+    except ImportError as error:
+        return f"OCR の部品（winrt）を読み込めませんでした: {error}"
+    except Exception as error:  # an OS without the API
+        return f"Windows の OCR を初期化できませんでした: {error}"
+    if engine is None:
+        return (
+            "OCR に使える言語が Windows にインストールされていません。"
+            "「設定 > 時刻と言語 > 言語と地域」で日本語の言語オプションを開き、"
+            "「光学式文字認識」を追加してからアプリを再起動してください"
+        )
+    return None
+
+
+def is_available() -> bool:
+    return unavailable_reason() is None
 
 
 def _prepare(image: Image.Image, max_side: int) -> Image.Image:

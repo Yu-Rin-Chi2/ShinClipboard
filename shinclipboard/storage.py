@@ -29,6 +29,7 @@ def default_config() -> dict[str, Any]:
         "settings": {
             "history_limit": 1000,
             "popup_hotkey": "",
+            "settings_hotkey": "",
             "fifo_toggle_hotkey": "primary+shift+f",
             "lifo_toggle_hotkey": "primary+shift+l",
             "monitor_toggle_hotkey": "primary+shift+m",

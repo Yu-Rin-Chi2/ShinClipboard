@@ -13,7 +13,7 @@ from shinclipboard.single_instance import SingleInstance
 from shinclipboard import storage
 from shinclipboard.storage import JsonStore, migrate_legacy_data_dir
 from shinclipboard.transfer import create_backup, export_snippets_csv, import_snippets_csv, restore_backup
-from shinclipboard.transforms import apply_transform
+from shinclipboard.transforms import TRANSFORM_TYPES, apply_transform, transform_kind, transform_label
 
 
 class HistoryTests(unittest.TestCase):
@@ -561,6 +561,13 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(replaced, "A# B#")
         groups = apply_transform("name: value", {"type": "regex", "params": {"pattern": r"(\w+): (\w+)", "replacement": "$2=$1"}})
         self.assertEqual(groups, "value=name")
+
+    def test_transform_labels_round_trip(self):
+        self.assertEqual(transform_label("prefix_each_line"), "各行に挿入")
+        for kind in TRANSFORM_TYPES:
+            self.assertEqual(transform_kind(transform_label(kind)), kind)
+        self.assertEqual(transform_label("unknown"), "unknown")
+        self.assertEqual(transform_kind("unknown"), "unknown")
 
 
 class TransferTests(unittest.TestCase):
