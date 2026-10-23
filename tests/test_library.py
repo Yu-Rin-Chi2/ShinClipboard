@@ -259,6 +259,33 @@ class LibraryAppTests(unittest.TestCase):
         finally:
             _destroy_root(root)
 
+    def test_opening_the_popup_only_rebuilds_lists_whose_content_changed(self):
+        root = self._root()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app = self._app(root, folder)
+                app.history.add("最初")
+                app._refresh_call_window()
+                history_rows = app.call_history_list
+                colour_rows = app.call_pages[2].listbox
+                history_rows.selection_set(0)
+                with unittest.mock.patch.object(history_rows, "delete", wraps=history_rows.delete) as rebuilt:
+                    app._refresh_call_window(only_if_changed=True)
+                rebuilt.assert_not_called()
+                self.assertEqual(history_rows.curselection(), (), "left as a rebuild would: nothing picked")
+
+                colours_before = colour_rows.size()
+                app.history.add("次")
+                # Groups are edited in place, so this is the same list object.
+                app.config["color_groups"][0]["colors"].append(
+                    {"id": "a", "title": "メイン", "value": "#075DCC", "memo": "", "hotkey": ""}
+                )
+                app._refresh_call_window(only_if_changed=True)
+                self.assertEqual(history_rows.size(), 2)
+                self.assertEqual(colour_rows.size(), colours_before + 1)
+        finally:
+            _destroy_root(root)
+
     def test_colour_rows_carry_a_swatch_and_a_quick_key_pastes_the_registered_spelling(self):
         pasted: list[str] = []
         root = self._root()

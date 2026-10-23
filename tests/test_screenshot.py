@@ -99,6 +99,48 @@ class PlatformTests(unittest.TestCase):
         # Inside the aware block the metrics are physical, so no scaling is needed.
         self.assertAlmostEqual(capture.scale, 1.0, places=2)
 
+    @unittest.skipUnless(os.name == "nt", "per-monitor DPI awareness is Windows only")
+    def test_the_overlay_window_itself_is_dpi_aware(self):
+        """Tk makes the native window when it is first shown, which fixes its DPI mode.
+
+        Shown outside the aware block, the overlay came up DPI unaware and
+        Windows stretched it by the system scale, so on a 150% monitor the
+        frozen picture sat larger and further right than the real screen.
+        """
+        import ctypes
+        import tkinter as tk
+        from unittest import mock
+
+        from shinclipboard import capture_overlay
+        from shinclipboard.screenshot import ScreenCapture
+
+        user32 = ctypes.windll.user32
+        if not hasattr(user32, "GetWindowDpiAwarenessContext"):
+            self.skipTest("this Windows build has no per-window DPI awareness")
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"no display: {error}")
+        root.withdraw()
+        # A tiny fake capture keeps the overlay to a corner of the screen.
+        capture = ScreenCapture(image=Image.new("RGB", (40, 30)), origin=(0, 0))
+        try:
+            with mock.patch.object(capture_overlay, "capture_virtual_screen", return_value=capture), \
+                    mock.patch.object(capture_overlay, "monitor_rects", return_value=[]), \
+                    mock.patch.object(capture_overlay, "window_rects", return_value=[]):
+                selector = capture_overlay.RegionSelector(root, lambda _image: None)
+                selector.start()
+            window = selector.window
+            self.assertIsNotNone(window)
+            hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+            user32.GetWindowDpiAwarenessContext.restype = ctypes.c_void_p
+            context = user32.GetWindowDpiAwarenessContext(hwnd)
+            awareness = user32.GetAwarenessFromDpiAwarenessContext(ctypes.c_void_p(context))
+            self.assertEqual(awareness, 2, "DPI_AWARENESS_PER_MONITOR_AWARE")
+            selector.cancel()
+        finally:
+            root.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

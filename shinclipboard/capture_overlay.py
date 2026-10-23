@@ -76,20 +76,28 @@ class RegionSelector:
                 self._monitors = monitor_rects()
                 self._windows = window_rects()
                 self._build_window()
+                window = self.window
+                if window is not None:
+                    # Tk only creates the native window when it is first mapped,
+                    # and that is the moment its DPI awareness is fixed, so this
+                    # has to stay inside the block. Mapped outside it the overlay
+                    # comes up DPI unaware and Windows stretches it by the system
+                    # scale, so the frozen picture no longer lines up with the
+                    # real screen.
+                    window.deiconify()
+                    # Everything above was drawn while the window was still
+                    # withdrawn. macOS Tk keeps no drawing for a window in that
+                    # state and does not catch up when it is mapped, so the
+                    # overlay would come up as an empty grey sheet over the whole
+                    # desktop. Flushing the idle work paints it without
+                    # re-entering the event loop, which the clipboard poll
+                    # running underneath depends on.
+                    window.update_idletasks()
         except Exception:
             self._close(None)
             raise
-        window = self.window
-        if window is not None:
-            window.deiconify()
-            # Everything above was drawn while the window was still withdrawn.
-            # macOS Tk keeps no drawing for a window in that state and does not
-            # catch up when it is mapped, so the overlay would come up as an
-            # empty grey sheet over the whole desktop. Flushing the idle work
-            # paints it without re-entering the event loop, which the clipboard
-            # poll running underneath depends on.
-            window.update_idletasks()
-            window.after(10, self._take_focus)
+        if self.window is not None:
+            self.window.after(10, self._take_focus)
 
     # ----- construction -----------------------------------------------------------
 

@@ -46,7 +46,7 @@ from .macos import (
 )
 from .platform_support import IS_MAC, UI_FONT_FAMILY
 from .single_instance import SingleInstance
-from .startup import migrate_legacy_startup, set_startup, startup_enabled
+from .startup import BACKGROUND_FLAG, migrate_legacy_startup, refresh_startup, set_startup, startup_enabled
 from .storage import JsonStore, default_data_dir, library_image_paths, migrate_legacy_data_dir
 from .transfer import (
     create_backup,
@@ -109,6 +109,7 @@ class CallPage:
     render: Callable[[str, dict], None]  # (quick-key prefix, item) -> appends a row
     group_id: str | None = None
     items: list[dict] = field(default_factory=list)
+    rendered: object = None  # what the rows were last built from; see _refresh_call_page
 
 
 def shortcut_modifier_mask() -> int:
@@ -127,6 +128,9 @@ def shortcut_modifier_mask() -> int:
 
 class ShinClipboardApp:
     POLL_MS = 350
+    # How often to look for requests from the hotkey and tray threads. They
+    # cannot touch Tk themselves, so this delay is added to every shortcut.
+    EVENT_POLL_MS = 15
     # How often to look at the macOS permission again. Rare enough that the
     # lookup never shows in the poll loop, often enough that granting it feels
     # like it took effect straight away.
@@ -166,6 +170,7 @@ class ShinClipboardApp:
         self._tree_thumbnails: dict[str, ImageTk.PhotoImage] = {}
         self._swatches: dict[tuple[int, int, int, int], ImageTk.PhotoImage] = {}
         self.call_pages: dict[int, CallPage] = {}  # popup tab index -> page (the history tab has none)
+        self._call_history_rendered: object = None
 
         self.search_var = tk.StringVar()
         self.snippet_search_var = tk.StringVar()
@@ -217,6 +222,7 @@ class ShinClipboardApp:
         self._check_macos_permissions()
         cleanup_exports(self.store.data_dir)
         self.root.after(self.POLL_MS, self._poll)
+        self.root.after(self.EVENT_POLL_MS, self._pump_events)
 
         if self.config["settings"].get("start_minimized"):
             self.root.withdraw()
@@ -648,7 +654,12 @@ class ShinClipboardApp:
             ("Ctrlキー2回で呼び出し画面を表示", self.double_ctrl_var),
         ]
         for index, (label, variable) in enumerate(checks):
-            ttk.Checkbutton(advanced, text=label, variable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 25), pady=3)
+            # Autostart lives in the OS, not in the config file, so it takes
+            # effect as soon as the box is ticked instead of waiting for 保存.
+            command = self._apply_startup if variable is self.startup_var else None
+            ttk.Checkbutton(advanced, text=label, variable=variable, command=command).grid(
+                row=index // 2, column=index % 2, sticky="w", padx=(0, 25), pady=3
+            )
         check_rows = (len(checks) + 1) // 2
         ttk.Label(advanced, text="フォントサイズ").grid(row=check_rows, column=0, sticky="w", pady=(8, 3))
         ttk.Spinbox(advanced, from_=8, to=24, textvariable=self.font_size_var, width=8).grid(row=check_rows + 1, column=0, sticky="w")
@@ -887,6 +898,17 @@ class ShinClipboardApp:
                     self.store.save_history(self.history)
                 self._refresh_history()
                 self._refresh_fifo()
+        self.root.after(self.POLL_MS, self._poll)
+
+    def _pump_events(self) -> None:
+        """Act on what the hotkey, tray and instance threads asked for.
+
+        Separate from the clipboard poll and much more frequent: a popup summoned
+        by a shortcut should not wait for the next clipboard check to come round.
+        Draining an empty queue costs next to nothing.
+        """
+        if self.closing:
+            return
         try:
             while True:
                 event, payload = self.events.get_nowait()
@@ -933,7 +955,7 @@ class ShinClipboardApp:
                     return
         except queue.Empty:
             pass
-        self.root.after(self.POLL_MS, self._poll)
+        self.root.after(self.EVENT_POLL_MS, self._pump_events)
 
     @staticmethod
     def _read_clipboard() -> str:
@@ -1040,20 +1062,40 @@ class ShinClipboardApp:
         self._refresh_transform_target()
         self._refresh_call_history()
 
-    def _refresh_call_window(self) -> None:
-        self._refresh_call_history()
+    def _refresh_call_window(self, only_if_changed: bool = False) -> None:
+        """Rebuild the popup's lists.
+
+        With `only_if_changed` a list whose content is what it was last built
+        from is only scrolled back to the top. Rebuilding a long history takes a
+        noticeable fraction of a second, which is too long to sit between the
+        shortcut and the popup.
+        """
+        self._refresh_call_history(only_if_changed)
         for page in self.call_pages.values():
-            self._refresh_call_page(page)
+            self._refresh_call_page(page, only_if_changed)
 
     def _refresh_call_snippets(self) -> None:
         self._refresh_call_page(self.call_pages[1])
 
-    def _refresh_call_history(self) -> None:
+    @staticmethod
+    def _rewind_call_list(widget: tk.Listbox | ImageListbox) -> None:
+        """Leave a list the way a rebuild would: nothing picked, scrolled to the top."""
+        widget.selection_clear(0, "end")
+        widget.yview_moveto(0)
+
+    def _refresh_call_history(self, only_if_changed: bool = False) -> None:
         if not hasattr(self, "call_history_list"):
             return
-        self.call_history_items = self.history.search()
-        self.call_history_list.delete(0, "end")
+        items = self.history.search()
         colors = self._theme_colors()
+        # History items are frozen, so equal tuples really are the same rows.
+        rendered = (tuple(items), tuple(colors.items()))
+        if only_if_changed and rendered == self._call_history_rendered:
+            self._rewind_call_list(self.call_history_list)
+            return
+        self._call_history_rendered = rendered
+        self.call_history_items = items
+        self.call_history_list.delete(0, "end")
         for index, item in enumerate(self.call_history_items):
             prefix = f"{quick_key(index)}: " if quick_key(index) else "   "
             thumbnail = self._thumbnail(item.image_path) if item.kind == "image" else None
@@ -1111,20 +1153,26 @@ class ShinClipboardApp:
 
     # ----- popup pages (definitions / colours / images) ---------------------------
 
-    def _refresh_call_page(self, page: CallPage) -> None:
+    def _refresh_call_page(self, page: CallPage, only_if_changed: bool = False) -> None:
+        groups = self.config[page.groups_key]
+        group_index = next((index for index, group in enumerate(groups) if group["id"] == page.group_id), 0)
+        colors = self._theme_colors()
+        # The groups are edited in place, so they are compared by value.
+        rendered = (groups[group_index]["id"] if groups else None, repr(groups), tuple(colors.items()))
+        if only_if_changed and rendered == page.rendered:
+            self._rewind_call_list(page.listbox)
+            return
+        page.rendered = rendered
         page.items = []
         page.listbox.delete(0, "end")
-        groups = self.config[page.groups_key]
         page.combo.configure(values=[group["name"] for group in groups])
         if not groups:
             page.group_id = None
             page.var.set("")
             return
-        group_index = next((index for index, group in enumerate(groups) if group["id"] == page.group_id), 0)
         group = groups[group_index]
         page.group_id = group["id"]
         page.combo.current(group_index)
-        colors = self._theme_colors()
         for item in group.get(page.items_key, []):
             index = len(page.items)
             page.items.append(item)
@@ -2551,6 +2599,16 @@ class ShinClipboardApp:
         self._apply_appearance()
         self.status_var.set("設定を保存しました")
 
+    def _apply_startup(self) -> None:
+        wanted = self.startup_var.get()
+        try:
+            set_startup(wanted)
+        except OSError as error:
+            self.startup_var.set(startup_enabled())
+            self.status_var.set(f"ログイン時の起動を変更できませんでした: {error}")
+            return
+        self.status_var.set("ログイン時に自動で起動します" if wanted else "ログイン時の自動起動をやめました")
+
     def _save_config(self, restart_hotkeys: bool = False) -> None:
         self.store.save_config(self.config)
         if restart_hotkeys:
@@ -2795,7 +2853,7 @@ class ShinClipboardApp:
         while it is open, and the application it interrupted is remembered so the
         keyboard can go straight back there when it closes.
         """
-        self._refresh_call_window()
+        self._refresh_call_window(only_if_changed=True)
         self._previous_app = frontmost_app()
         self.call_window.deiconify()
         self.call_window.lift()
@@ -3251,12 +3309,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ShinClipboard")
     parser.add_argument("--data-dir", type=Path, default=default_data_dir(), help="履歴などの保存先")
     parser.add_argument("--config", type=Path, help="共有する設定JSONのパス")
+    parser.add_argument(BACKGROUND_FLAG, action="store_true", help="ウィンドウを出さずにトレイで起動する（自動起動用）")
     return parser
 
 
 def run(argv: list[str] | None = None) -> None:
     migrate_legacy_data_dir()
     migrate_legacy_startup()
+    refresh_startup()
     args = build_parser().parse_args(argv)
     instance = SingleInstance(args.data_dir)
     if not instance.acquire():
@@ -3265,6 +3325,8 @@ def run(argv: list[str] | None = None) -> None:
     try:
         root = tk.Tk()
         app = ShinClipboardApp(root, JsonStore(args.data_dir, args.config))
+        if args.background:
+            app.hide_window()
         instance.start_listener(lambda: app.events.put(("show", None)))
         # The editor's font menu needs every font file opened once; that takes
         # seconds, so it happens here in the background rather than on the
