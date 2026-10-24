@@ -22,7 +22,6 @@ Windows / macOS 向けの、クリップボード履歴・定型文・連続貼�
 - [他の端末への引き継ぎ](#他の端末への引き継ぎ)
 - [保存先](#保存先)
 - [配布版の実行について](#配布版の実行について)
-- [NewClipboardからの移行](#newclipboardからの移行)
 - [開発者向け情報](#開発者向け情報)
 - [ライセンス](#ライセンス)
 
@@ -439,15 +438,6 @@ xattr -dr com.apple.quarantine /Applications/ShinClipboard.app
 
 アンインストールは `.app` を削除するだけです。設定と履歴は上記の「保存先」に、自動起動の登録は
 `~/Library/LaunchAgents/com.shinclipboard.app.plist` に残るので、必要なら合わせて削除してください。
-
-## NewClipboardからの移行
-
-0.3.0でアプリ名を NewClipboard から ShinClipboard へ変更しました。旧名称で使っていた場合、初回起動時に次を自動で引き継ぎます。
-
-- 保存データ（`%APPDATA%\NewClipboard` / `~/.newclipboard`）を新しい保存先へ**コピー**します。旧フォルダはそのまま残すので、動作を確認してから手動で削除してください
-- OSの自動起動登録を新しい実行ファイルへ付け替え、旧登録を削除します
-
-旧バージョンで作成したZIPバックアップとCSVは、そのまま読み込めます。
 
 ## 開発者向け情報
 
